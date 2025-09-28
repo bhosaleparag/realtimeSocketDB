@@ -1,7 +1,7 @@
 // handlers/leaderboardHandler.js - Real-time Leaderboard Management
 const admin = require('firebase-admin');
 
-module.exports = ({ socket, io, db, activeUsers }) => {
+module.exports = ({ socket, io, db }) => {
   
   // Update user score
   socket.on('update-score', async (data) => {
@@ -14,11 +14,9 @@ module.exports = ({ socket, io, db, activeUsers }) => {
         socket.emit('leaderboard-error', { message: 'Valid points value is required' });
         return;
       }
-      
       // Get or create user leaderboard entry
       const userLeaderboardRef = db.collection('leaderboard').doc(userId);
       const userLeaderboardDoc = await userLeaderboardRef.get();
-      
       let currentData = {
         userId: userId,
         username: username,
@@ -63,15 +61,15 @@ module.exports = ({ socket, io, db, activeUsers }) => {
       await userLeaderboardRef.set(updatedData, { merge: true });
       
       // Log score update
-      await db.collection('scoreHistory').add({
-        userId: userId,
-        username: username,
-        points: points,
-        reason: reason,
-        gameType: gameType,
-        totalScoreAfter: newTotalScore,
-        timestamp: admin.firestore.FieldValue.serverTimestamp()
-      });
+      // await db.collection('scoreHistory').add({
+      //   userId: userId,
+      //   username: username,
+      //   points: points,
+      //   reason: reason,
+      //   gameType: gameType,
+      //   totalScoreAfter: newTotalScore,
+      //   timestamp: admin.firestore.FieldValue.serverTimestamp()
+      // });
       
       // Prepare broadcast data
       const broadcastData = {
@@ -127,57 +125,71 @@ module.exports = ({ socket, io, db, activeUsers }) => {
       } = data;
       
       let query = db.collection('leaderboard');
-      
-      // Apply time filter if needed
+
+      // Timeframe filter
       if (timeframe !== 'all') {
         const timeLimit = getTimeLimit(timeframe);
         query = query.where('lastPlayed', '>=', timeLimit);
       }
-      
-      // Sort and limit
-      query = query.orderBy(sortBy, 'desc').limit(limit);
-      
+
+      // If sorting by winRate, we can’t do it in Firestore
+      if (sortBy !== 'winRate') {
+        query = query.orderBy(sortBy, 'desc').limit(limit);
+      }
+
       const snapshot = await query.get();
-      const leaderboard = [];
-      
-      snapshot.forEach((doc, index) => {
-        const data = doc.data();
-        
-        // Calculate rank
+      let docs = snapshot.docs.map(doc => doc.data());
+
+      // Handle winRate sorting manually
+      if (sortBy === 'winRate') {
+        docs = docs.sort((a, b) => {
+          const winRateA = a.gamesPlayed > 0 ? ((a.wins || 0) / a.gamesPlayed) * 100 : 0;
+          const winRateB = b.gamesPlayed > 0 ? ((b.wins || 0) / b.gamesPlayed) * 100 : 0;
+          return winRateB - winRateA; // descending
+        }).slice(0, limit);
+      }
+
+      // Build leaderboard array
+      const leaderboard = docs.map((data, index) => {
         const rank = index + 1;
-        
-        // Get game type specific score if requested
+
+        // Game-type specific score
         let displayScore = data.totalScore;
         if (gameType !== 'all' && data.gameTypeScores && data.gameTypeScores[gameType]) {
           displayScore = data.gameTypeScores[gameType].score;
         }
-        
-        leaderboard.push({
-          rank: rank,
+
+        // Compute winRate if needed
+        const winRate = data.gamesPlayed > 0
+          ? Math.round(((data.wins || 0) / data.gamesPlayed) * 100)
+          : 0;
+
+        return {
+          rank,
           userId: data.userId,
           username: data.username,
           totalScore: data.totalScore,
-          displayScore: displayScore,
+          displayScore,
           gamesPlayed: data.gamesPlayed,
           averageScore: data.averageScore,
           wins: data.wins || 0,
           losses: data.losses || 0,
-          winRate: data.gamesPlayed > 0 ? Math.round((data.wins || 0) / data.gamesPlayed * 100) : 0,
+          winRate,
           lastPlayed: data.lastPlayed?.toDate(),
           achievements: data.achievements || [],
           gameTypeScores: data.gameTypeScores || {}
-        });
+        };
       });
-      
+
       socket.emit('leaderboard-data', {
-        leaderboard: leaderboard,
-        gameType: gameType,
-        sortBy: sortBy,
-        timeframe: timeframe,
+        leaderboard,
+        gameType,
+        sortBy,
+        timeframe,
         totalEntries: leaderboard.length,
         lastUpdated: new Date()
       });
-      
+
     } catch (error) {
       console.error('Error getting leaderboard:', error);
       socket.emit('leaderboard-error', {
@@ -185,6 +197,7 @@ module.exports = ({ socket, io, db, activeUsers }) => {
       });
     }
   });
+
   
   // Get user's leaderboard position
   socket.on('get-my-position', async (data) => {

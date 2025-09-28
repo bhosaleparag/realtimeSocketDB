@@ -3,17 +3,31 @@ const admin = require('firebase-admin');
 
 module.exports = ({ socket, io, db, activeUsers }) => {
   
+  // Utility: broadcast online users to everyone
+  const broadcastOnlineUsers = () => {
+    const onlineUsers = Array.from(activeUsers.values())
+      .filter(user => user.status === 'online')
+      .map(user => ({
+        id: user.id,
+        username: user.username,
+        status: user.status,
+        joinedAt: user.joinedAt,
+        lastActivity: user.lastActivity
+      }));
+
+    io.emit('online-users', onlineUsers);
+  };
+
   // Update user presence status
   socket.on('update-presence', async (data) => {
     try {
-      const { status, customMessage } = data;
+      const { status } = data;
       const userId = socket.userId;
       
       // Update in memory
       const userData = activeUsers.get(userId);
       if (userData) {
         userData.status = status;
-        userData.customMessage = customMessage;
         userData.lastActivity = new Date();
         activeUsers.set(userId, userData);
       }
@@ -23,7 +37,6 @@ module.exports = ({ socket, io, db, activeUsers }) => {
         userId: userId,
         username: socket.username,
         status: status,
-        customMessage: customMessage || null,
         lastActivity: admin.firestore.FieldValue.serverTimestamp(),
         socketId: socket.id
       }, { merge: true });
@@ -33,14 +46,13 @@ module.exports = ({ socket, io, db, activeUsers }) => {
         userId: userId,
         username: socket.username,
         status: status,
-        customMessage: customMessage,
         timestamp: new Date()
       });
+
+      // 🔥 Broadcast the full online users list
+      broadcastOnlineUsers();
       
-      socket.emit('presence-update-success', {
-        status: status,
-        customMessage: customMessage
-      });
+      socket.emit('presence-update-success', { status });
       
     } catch (error) {
       console.error('Error updating presence:', error);
@@ -50,63 +62,14 @@ module.exports = ({ socket, io, db, activeUsers }) => {
     }
   });
   
-  // Get all online users
+  // Get all online users (manual request)
   socket.on('get-online-users', async () => {
     try {
-      const onlineUsers = Array.from(activeUsers.values())
-        .filter(user => user.status === 'online')
-        .map(user => ({
-          id: user.id,
-          username: user.username,
-          status: user.status,
-          customMessage: user.customMessage,
-          joinedAt: user.joinedAt,
-          lastActivity: user.lastActivity
-        }));
-      
-      socket.emit('online-users', {
-        users: onlineUsers,
-        count: onlineUsers.length,
-        totalActive: activeUsers.size
-      });
-      
+      broadcastOnlineUsers(); // reuse the utility
     } catch (error) {
       console.error('Error getting online users:', error);
       socket.emit('presence-error', {
         message: 'Failed to get online users'
-      });
-    }
-  });
-  
-  // Get user presence history
-  socket.on('get-presence-history', async (data) => {
-    try {
-      const { userId, limit = 50 } = data;
-      
-      const snapshot = await db.collection('presenceHistory')
-        .where('userId', '==', userId)
-        .orderBy('timestamp', 'desc')
-        .limit(limit)
-        .get();
-      
-      const history = [];
-      snapshot.forEach(doc => {
-        history.push({
-          id: doc.id,
-          ...doc.data(),
-          timestamp: doc.data().timestamp?.toDate()
-        });
-      });
-      
-      socket.emit('presence-history', {
-        userId: userId,
-        history: history
-      });
-      
-    } catch (error) {
-      console.error('Error getting presence history:', error);
-      socket.emit('presence-error', {
-        message: 'Failed to get presence history'
       });
     }
   });
@@ -129,20 +92,14 @@ module.exports = ({ socket, io, db, activeUsers }) => {
         lastActivity: admin.firestore.FieldValue.serverTimestamp()
       });
       
-      // Log presence change
-      await db.collection('presenceHistory').add({
-        userId: userId,
-        username: socket.username,
-        action: 'went_idle',
-        timestamp: admin.firestore.FieldValue.serverTimestamp()
-      });
-      
-      // Broadcast idle status
       io.emit('user-went-idle', {
-        userId: userId,
+        userId,
         username: socket.username,
         timestamp: new Date()
       });
+
+      // 🔥 Broadcast updated list
+      broadcastOnlineUsers();
       
     } catch (error) {
       console.error('Error setting user idle:', error);
@@ -161,26 +118,19 @@ module.exports = ({ socket, io, db, activeUsers }) => {
         activeUsers.set(userId, userData);
       }
       
-      // Update in Firebase
       await db.collection('userPresence').doc(userId).update({
         status: 'online',
         lastActivity: admin.firestore.FieldValue.serverTimestamp()
       });
-      
-      // Log presence change
-      await db.collection('presenceHistory').add({
-        userId: userId,
-        username: socket.username,
-        action: 'became_active',
-        timestamp: admin.firestore.FieldValue.serverTimestamp()
-      });
-      
-      // Broadcast active status
+
       io.emit('user-became-active', {
-        userId: userId,
+        userId,
         username: socket.username,
         timestamp: new Date()
       });
+
+      // 🔥 Broadcast updated list
+      broadcastOnlineUsers();
       
     } catch (error) {
       console.error('Error setting user active:', error);
@@ -192,9 +142,16 @@ module.exports = ({ socket, io, db, activeUsers }) => {
     try {
       const userId = socket.userId;
       
-      // Set initial presence in Firebase
+      activeUsers.set(userId, {
+        id: userId,
+        username: socket.username,
+        status: 'online',
+        joinedAt: new Date(),
+        lastActivity: new Date()
+      });
+      
       await db.collection('userPresence').doc(userId).set({
-        userId: userId,
+        userId,
         username: socket.username,
         status: 'online',
         lastActivity: admin.firestore.FieldValue.serverTimestamp(),
@@ -202,22 +159,33 @@ module.exports = ({ socket, io, db, activeUsers }) => {
         connectedAt: admin.firestore.FieldValue.serverTimestamp()
       }, { merge: true });
       
-      // Log connection
-      await db.collection('presenceHistory').add({
-        userId: userId,
-        username: socket.username,
-        action: 'connected',
-        timestamp: admin.firestore.FieldValue.serverTimestamp(),
-        socketId: socket.id
-      });
-      
       socket.emit('initial-presence-set', {
-        userId: userId,
+        userId,
         status: 'online'
       });
+
+      // 🔥 Broadcast updated list
+      broadcastOnlineUsers();
       
     } catch (error) {
       console.error('Error setting initial presence:', error);
+    }
+  });
+
+  // When socket disconnects
+  socket.on('disconnect', () => {
+    const userId = socket.userId;
+    if (userId && activeUsers.has(userId)) {
+      activeUsers.delete(userId);
+
+      io.emit('user-disconnected', {
+        userId,
+        username: socket.username,
+        timestamp: new Date()
+      });
+
+      // 🔥 Broadcast updated list
+      broadcastOnlineUsers();
     }
   });
   

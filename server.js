@@ -11,6 +11,7 @@ const presenceHandler = require('./handlers/presenceHandler');
 const chatHandler = require('./handlers/chatHandler');
 const roomHandler = require('./handlers/roomHandler');
 const leaderboardHandler = require('./handlers/leaderboardHandler');
+const friendHandler = require('./handlers/friendHandler');
 
 // Initialize Express app
 const app = express();
@@ -20,14 +21,14 @@ const server = http.createServer(app);
 const serviceAccount = {
   "type": "service_account",
   "project_id": process.env.FIREBASE_PROJECT_ID,
-  "private_key_id": "abf65a4d1db28db8f606d36abd0ac7ebde8974f4",
+  "private_key_id": "e85b67891e953125eb9ec955aedc4bc6675c76b5",
   "private_key": process.env.FIREBASE_PRIVATE_KEY,
   "client_email": process.env.FIREBASE_CLIENT_EMAIL,
-  "client_id": "117581257007229392200",
+  "client_id": "118217008912100827596",
   "auth_uri": "https://accounts.google.com/o/oauth2/auth",
   "token_uri": "https://oauth2.googleapis.com/token",
   "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/firebase-adminsdk-fbsvc%40dev-battle-e8b3f.iam.gserviceaccount.com",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/firebase-adminsdk-fbsvc%40dev-battle-8b5b4.iam.gserviceaccount.com",
   "universe_domain": "googleapis.com"
 }; 
 
@@ -58,7 +59,7 @@ const activeUsers = new Map();
 const activeRooms = new Map();
 const roomUsers = new Map(); // roomId -> Set of userIds
 
-// Middleware for authentication (optional)
+// Middleware for check user data 
 io.use((socket, next) => {
   const userId = socket.handshake.auth.userId;
   const username = socket.handshake.auth.username;
@@ -96,6 +97,7 @@ io.on('connection', (socket) => {
   chatHandler(context);
   roomHandler(context);
   leaderboardHandler(context);
+  friendHandler(context);
   
   // Handle disconnection
   socket.on('disconnect', () => {

@@ -1,6 +1,6 @@
 const admin = require('firebase-admin');
 
-module.exports = ({ socket, io, db, activeUsers }) => {
+module.exports = ({ socket, io, db }) => {
   
   // Send message to global chat
   socket.on('send-global-message', async (data) => {
@@ -22,7 +22,6 @@ module.exports = ({ socket, io, db, activeUsers }) => {
       
       // Create message object
       const messageData = {
-        id: admin.firestore.FieldValue.serverTimestamp(), // Will be replaced with actual timestamp
         userId: userId,
         username: username,
         message: message.trim(),
@@ -39,7 +38,7 @@ module.exports = ({ socket, io, db, activeUsers }) => {
       // Get the actual timestamp for broadcasting
       const savedDoc = await docRef.get();
       const savedData = savedDoc.data();
-      
+
       const broadcastMessage = {
         id: docRef.id,
         userId: userId,

@@ -6,7 +6,7 @@ module.exports = ({ socket, io, db, activeUsers, activeRooms, roomUsers }) => {
   // Create new match room
   socket.on('create-room', async (data) => {
     try {
-      const { roomName, roomType = 'public', maxPlayers = 4, gameSettings = {} } = data;
+      const { roomName, roomType = 'public', maxPlayers = 5, gameSettings = {} } = data;
       const userId = socket.userId;
       const username = socket.username;
       
