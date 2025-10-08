@@ -1,9 +1,13 @@
-// handlers/leaderboardHandler.js - Real-time Leaderboard Management
+// handlers/leaderboardHandler.js - Leaderboard Management with Redis
 const admin = require('firebase-admin');
+const redisService = require('../services/redisService');
+const { isRedisAvailable } = require('../config/redis.config');
 
 module.exports = ({ socket, io, db }) => {
+  // Helper function to use Redis or fallback to memory
+  const useRedis = isRedisAvailable();
   
-  // Update user score
+  // Update score
   socket.on('update-score', async (data) => {
     try {
       const { points, reason, gameType = 'general' } = data;
@@ -14,9 +18,11 @@ module.exports = ({ socket, io, db }) => {
         socket.emit('leaderboard-error', { message: 'Valid points value is required' });
         return;
       }
+      
       // Get or create user leaderboard entry
       const userLeaderboardRef = db.collection('leaderboard').doc(userId);
       const userLeaderboardDoc = await userLeaderboardRef.get();
+      
       let currentData = {
         userId: userId,
         username: username,
@@ -57,19 +63,8 @@ module.exports = ({ socket, io, db }) => {
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       };
       
-      // Save to Firebase
+      // Save to Firebase (primary persistent storage)
       await userLeaderboardRef.set(updatedData, { merge: true });
-      
-      // Log score update
-      // await db.collection('scoreHistory').add({
-      //   userId: userId,
-      //   username: username,
-      //   points: points,
-      //   reason: reason,
-      //   gameType: gameType,
-      //   totalScoreAfter: newTotalScore,
-      //   timestamp: admin.firestore.FieldValue.serverTimestamp()
-      // });
       
       // Prepare broadcast data
       const broadcastData = {
@@ -85,8 +80,8 @@ module.exports = ({ socket, io, db }) => {
       // Broadcast score update
       io.emit('score-updated', broadcastData);
       
-      // Check for achievements
-      const achievements = await checkAchievements(userId, updatedData, db);
+      // Check for achievements (using your existing function)
+      const achievements = await checkAchievements(updatedData);
       if (achievements.length > 0) {
         await userLeaderboardRef.update({
           achievements: admin.firestore.FieldValue.arrayUnion(...achievements)
@@ -124,15 +119,18 @@ module.exports = ({ socket, io, db }) => {
         timeframe = 'all' 
       } = data;
       
+      let leaderboard = [];
+      
+      // Fallback to Firebase or for complex queries
       let query = db.collection('leaderboard');
 
-      // Timeframe filter
+      // Timeframe filter (using your existing getTimeLimit function)
       if (timeframe !== 'all') {
         const timeLimit = getTimeLimit(timeframe);
         query = query.where('lastPlayed', '>=', timeLimit);
       }
 
-      // If sorting by winRate, we can’t do it in Firestore
+      // If sorting by winRate, we can't do it in Firestore
       if (sortBy !== 'winRate') {
         query = query.orderBy(sortBy, 'desc').limit(limit);
       }
@@ -145,12 +143,12 @@ module.exports = ({ socket, io, db }) => {
         docs = docs.sort((a, b) => {
           const winRateA = a.gamesPlayed > 0 ? ((a.wins || 0) / a.gamesPlayed) * 100 : 0;
           const winRateB = b.gamesPlayed > 0 ? ((b.wins || 0) / b.gamesPlayed) * 100 : 0;
-          return winRateB - winRateA; // descending
+          return winRateB - winRateA;
         }).slice(0, limit);
       }
 
       // Build leaderboard array
-      const leaderboard = docs.map((data, index) => {
+      leaderboard = docs.map((data, index) => {
         const rank = index + 1;
 
         // Game-type specific score
@@ -159,7 +157,7 @@ module.exports = ({ socket, io, db }) => {
           displayScore = data.gameTypeScores[gameType].score;
         }
 
-        // Compute winRate if needed
+        // Compute winRate
         const winRate = data.gamesPlayed > 0
           ? Math.round(((data.wins || 0) / data.gamesPlayed) * 100)
           : 0;
@@ -187,7 +185,8 @@ module.exports = ({ socket, io, db }) => {
         sortBy,
         timeframe,
         totalEntries: leaderboard.length,
-        lastUpdated: new Date()
+        lastUpdated: new Date(),
+        source: 'firebase'
       });
 
     } catch (error) {
@@ -198,21 +197,21 @@ module.exports = ({ socket, io, db }) => {
     }
   });
 
-  
   // Get user's leaderboard position
   socket.on('get-my-position', async (data) => {
     try {
       const { gameType = 'all' } = data;
       const userId = socket.userId;
       
-      // Get user's data
+      // Fallback to Firebase
       const userDoc = await db.collection('leaderboard').doc(userId).get();
       
       if (!userDoc.exists) {
         socket.emit('my-position', {
           position: 'Unranked',
           totalScore: 0,
-          gamesPlayed: 0
+          gamesPlayed: 0,
+          source: 'firebase'
         });
         return;
       }
@@ -246,7 +245,8 @@ module.exports = ({ socket, io, db }) => {
           gamesPlayed: userData.gamesPlayed,
           averageScore: userData.averageScore,
           achievements: userData.achievements || [],
-          gameType: gameType
+          gameType: gameType,
+          source: 'firebase'
         });
         return;
       }
@@ -259,7 +259,8 @@ module.exports = ({ socket, io, db }) => {
         totalScore: userData.totalScore,
         gamesPlayed: userData.gamesPlayed,
         averageScore: userData.averageScore,
-        achievements: userData.achievements || []
+        achievements: userData.achievements || [],
+        source: 'firebase'
       });
       
     } catch (error) {
@@ -332,11 +333,28 @@ module.exports = ({ socket, io, db }) => {
   // Get leaderboard stats
   socket.on('get-leaderboard-stats', async () => {
     try {
-      // Get total users
+      // Try Redis first for aggregated stats
+      if (useRedis) {
+        try {
+          const stats = await redisService.getLeaderboardStats();
+          
+          if (stats) {
+            socket.emit('leaderboard-stats', {
+              ...stats,
+              timestamp: new Date(),
+              source: 'redis'
+            });
+            return;
+          }
+        } catch (redisError) {
+          console.error('Redis stats query failed, falling back to Firebase:', redisError);
+        }
+      }
+      
+      // Fallback to Firebase
       const totalUsersSnapshot = await db.collection('leaderboard').count().get();
       const totalUsers = totalUsersSnapshot.data().count;
       
-      // Get top score
       const topScoreSnapshot = await db.collection('leaderboard')
         .orderBy('totalScore', 'desc')
         .limit(1)
@@ -351,7 +369,6 @@ module.exports = ({ socket, io, db }) => {
         topPlayer = topData.username;
       }
       
-      // Get average score
       const allUsersSnapshot = await db.collection('leaderboard').get();
       let totalScore = 0;
       let totalGames = 0;
@@ -365,6 +382,22 @@ module.exports = ({ socket, io, db }) => {
       const averageScore = totalUsers > 0 ? Math.round(totalScore / totalUsers) : 0;
       const averageGamesPlayed = totalUsers > 0 ? Math.round(totalGames / totalUsers) : 0;
       
+      // Cache stats in Redis for future requests
+      if (useRedis) {
+        try {
+          await redisService.cacheLeaderboardStats({
+            totalUsers,
+            topScore,
+            topPlayer,
+            averageScore,
+            averageGamesPlayed,
+            totalGamesPlayed: totalGames
+          });
+        } catch (redisError) {
+          console.error('Redis cache failed (non-critical):', redisError);
+        }
+      }
+      
       socket.emit('leaderboard-stats', {
         totalUsers: totalUsers,
         topScore: topScore,
@@ -372,7 +405,8 @@ module.exports = ({ socket, io, db }) => {
         averageScore: averageScore,
         averageGamesPlayed: averageGamesPlayed,
         totalGamesPlayed: totalGames,
-        timestamp: new Date()
+        timestamp: new Date(),
+        source: 'firebase'
       });
       
     } catch (error) {
@@ -382,36 +416,10 @@ module.exports = ({ socket, io, db }) => {
       });
     }
   });
-  
-  // Subscribe to live leaderboard updates
-  socket.on('subscribe-leaderboard-updates', (data) => {
-    const { gameType = 'all' } = data;
-    
-    // Join leaderboard update room
-    socket.join(`leaderboard-${gameType}`);
-    
-    socket.emit('subscribed-to-leaderboard', {
-      gameType: gameType,
-      message: 'Subscribed to live leaderboard updates'
-    });
-  });
-  
-  // Unsubscribe from live leaderboard updates
-  socket.on('unsubscribe-leaderboard-updates', (data) => {
-    const { gameType = 'all' } = data;
-    
-    // Leave leaderboard update room
-    socket.leave(`leaderboard-${gameType}`);
-    
-    socket.emit('unsubscribed-from-leaderboard', {
-      gameType: gameType,
-      message: 'Unsubscribed from live leaderboard updates'
-    });
-  });
 };
 
 // Helper function to check for achievements
-async function checkAchievements(userId, userData, db) {
+async function checkAchievements(userData) {
   const newAchievements = [];
   const currentAchievements = userData.achievements || [];
   

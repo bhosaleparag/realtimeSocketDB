@@ -1,80 +1,20 @@
-const admin = require('firebase-admin');
+const redisService = require('../services/redisService');
+const { isRedisAvailable } = require('../config/redis.config');
 
-module.exports = ({ socket, io, db }) => {
+module.exports = ({ socket, io }) => {
   
-  // Send message to global chat
-  socket.on('send-global-message', async (data) => {
-    try {
-      const { message, type = 'text' } = data;
-      const userId = socket.userId;
-      const username = socket.username;
-      
-      // Validate message
-      if (!message || message.trim().length === 0) {
-        socket.emit('chat-error', { message: 'Message cannot be empty' });
-        return;
-      }
-      
-      if (message.length > 1000) {
-        socket.emit('chat-error', { message: 'Message too long (max 1000 characters)' });
-        return;
-      }
-      
-      // Create message object
-      const messageData = {
-        userId: userId,
-        username: username,
-        message: message.trim(),
-        type: type,
-        chatType: 'global',
-        timestamp: admin.firestore.FieldValue.serverTimestamp(),
-        edited: false,
-        replies: []
-      };
-      
-      // Save to Firebase
-      const docRef = await db.collection('globalChat').add(messageData);
-      
-      // Get the actual timestamp for broadcasting
-      const savedDoc = await docRef.get();
-      const savedData = savedDoc.data();
-
-      const broadcastMessage = {
-        id: docRef.id,
-        userId: userId,
-        username: username,
-        message: message.trim(),
-        type: type,
-        chatType: 'global',
-        timestamp: savedData.timestamp?.toDate(),
-        edited: false,
-        replies: []
-      };
-      
-      // Broadcast to all users
-      io.emit('new-global-message', broadcastMessage);
-      
-      // Confirm to sender
-      socket.emit('message-sent', {
-        messageId: docRef.id,
-        timestamp: savedData.timestamp?.toDate()
-      });
-      
-    } catch (error) {
-      console.error('Error sending global message:', error);
-      socket.emit('chat-error', {
-        message: 'Failed to send message'
-      });
-    }
-  });
+  // Helper function to use Redis or fallback to memory
+  const useRedis = isRedisAvailable();
   
   // Send message to specific room
   socket.on('send-room-message', async (data) => {
     try {
-      const { roomId, message, type = 'text' } = data;
+      const { roomId, message } = data;
       const userId = socket.userId;
       const username = socket.username;
       
+      // Helper function to use Redis or fallback to memory
+
       // Validate inputs
       if (!roomId || !message || message.trim().length === 0) {
         socket.emit('chat-error', { message: 'Room ID and message are required' });
@@ -86,56 +26,46 @@ module.exports = ({ socket, io, db }) => {
         return;
       }
       
+      if (!useRedis) {
+        socket.emit('chat-error', { message: 'Chat service unavailable' });
+        return;
+      }
+      
       // Check if user is in the room
-      const roomDoc = await db.collection('matchRooms').doc(roomId).get();
-      if (!roomDoc.exists) {
+      const roomData = await redisService.getRoom(roomId);
+      if (!roomData) {
         socket.emit('chat-error', { message: 'Room does not exist' });
         return;
       }
       
-      const roomData = roomDoc.data();
       if (!roomData.participants || !roomData.participants.includes(userId)) {
         socket.emit('chat-error', { message: 'You are not a member of this room' });
         return;
       }
       
       // Create message object
+      const messageId = `msg_${Date.now()}_${userId}`;
       const messageData = {
+        id: messageId,
         userId: userId,
         username: username,
         message: message.trim(),
-        type: type,
         roomId: roomId,
-        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        timestamp: Date.now(),
         edited: false
       };
       
-      // Save to Firebase
-      const docRef = await db.collection('roomChat').add(messageData);
-      
-      // Get the actual timestamp for broadcasting
-      const savedDoc = await docRef.get();
-      const savedData = savedDoc.data();
-      
-      const broadcastMessage = {
-        id: docRef.id,
-        userId: userId,
-        username: username,
-        message: message.trim(),
-        type: type,
-        roomId: roomId,
-        timestamp: savedData.timestamp?.toDate(),
-        edited: false
-      };
+      // Save to Redis
+      await redisService.saveRoomMessage(roomId, messageData);
       
       // Broadcast to room members only
-      io.to(roomId).emit('new-room-message', broadcastMessage);
+      io.to(roomId).emit('new-room-message', messageData);
       
       // Confirm to sender
       socket.emit('message-sent', {
-        messageId: docRef.id,
+        messageId: messageId,
         roomId: roomId,
-        timestamp: savedData.timestamp?.toDate()
+        timestamp: messageData.timestamp
       });
       
     } catch (error) {
@@ -145,44 +75,71 @@ module.exports = ({ socket, io, db }) => {
       });
     }
   });
-  
-  // Get global chat history
-  socket.on('get-global-chat-history', async (data) => {
+
+  // Send message to friend (private chat)
+  socket.on('send-friend-message', async (data) => {
     try {
-      const { limit = 50, before } = data;
-      
-      let query = db.collection('globalChat')
-        .orderBy('timestamp', 'desc')
-        .limit(limit);
-      
-      if (before) {
-        query = query.startAfter(before);
+      const { friendId, message } = data;
+      const userId = socket.userId;
+
+      if (!friendId || !message || message.trim().length === 0 || message.length > 1000) {
+        socket.emit('chat-error', { message: 'Invalid message data.' });
+        return;
       }
-      
-      const snapshot = await query.get();
-      const messages = [];
-      
-      snapshot.forEach(doc => {
-        messages.push({
-          id: doc.id,
-          ...doc.data(),
-          timestamp: doc.data().timestamp?.toDate()
-        });
-      });
-      
-      // Return in chronological order (oldest first)
-      messages.reverse();
-      
-      socket.emit('global-chat-history', {
-        messages: messages,
-        hasMore: messages.length === limit
-      });
-      
+
+      if (!useRedis) {
+        socket.emit('chat-error', { message: 'Chat service unavailable' });
+        return;
+      }
+
+      const conversationId = [userId, friendId].sort().join('_');
+      const messageId = `msg_${Date.now()}_${userId}`;
+
+      const messageData = {
+        id: messageId,
+        conversationId: conversationId,
+        senderId: userId,
+        receiverId: friendId,
+        message: message.trim(),
+        timestamp: Date.now(),
+      };
+
+      // Save to Redis
+      await redisService.saveFriendMessage(conversationId, messageData);
+
+      // Broadcast message
+      socket.emit('new-friend-message', messageData);
+      io.to(`user_${friendId}`).emit('new-friend-message', messageData);
+
     } catch (error) {
-      console.error('Error getting global chat history:', error);
-      socket.emit('chat-error', {
-        message: 'Failed to load chat history'
+      console.error('Error sending message:', error);
+      socket.emit('chat-error', { message: 'Failed to send message.' });
+    }
+  });
+
+  // Get friend chat history
+  socket.on('get-friend-chat-history', async (data) => {
+    try {
+      const { friendId, limit = 50, before } = data;
+      const userId = socket.userId;
+
+      if (!useRedis) {
+        socket.emit('chat-error', { message: 'Chat service unavailable' });
+        return;
+      }
+
+      const conversationId = [userId, friendId].sort().join('_');
+
+      // Get messages from Redis
+      const allMessages = await redisService.getFriendMessages(conversationId, limit, before);
+
+      socket.emit('friend-chat-history', {
+        messages: allMessages,
+        hasMore: allMessages.length === limit,
       });
+    } catch (error) {
+      console.error('Error getting history:', error);
+      socket.emit('chat-error', { message: 'Failed to load history.' });
     }
   });
   
@@ -195,29 +152,13 @@ module.exports = ({ socket, io, db }) => {
         socket.emit('chat-error', { message: 'Room ID is required' });
         return;
       }
-      
-      let query = db.collection('roomChat')
-        .where('roomId', '==', roomId)
-        .orderBy('timestamp', 'desc')
-        .limit(limit);
-      
-      if (before) {
-        query = query.startAfter(before);
+
+      if (!useRedis) {
+        socket.emit('chat-error', { message: 'Chat service unavailable' });
+        return;
       }
       
-      const snapshot = await query.get();
-      const messages = [];
-      
-      snapshot.forEach(doc => {
-        messages.push({
-          id: doc.id,
-          ...doc.data(),
-          timestamp: doc.data().timestamp?.toDate()
-        });
-      });
-      
-      // Return in chronological order (oldest first)
-      messages.reverse();
+      const messages = await redisService.getRoomMessages(roomId, limit, before);
       
       socket.emit('room-chat-history', {
         roomId: roomId,
@@ -236,9 +177,9 @@ module.exports = ({ socket, io, db }) => {
   // Edit message
   socket.on('edit-message', async (data) => {
     try {
-      const { messageId, newMessage, chatType } = data;
+      const { messageId, newMessage, chatType, roomId } = data;
       const userId = socket.userId;
-      
+
       if (!messageId || !newMessage || newMessage.trim().length === 0) {
         socket.emit('chat-error', { message: 'Message ID and new message are required' });
         return;
@@ -248,54 +189,55 @@ module.exports = ({ socket, io, db }) => {
         socket.emit('chat-error', { message: 'Message too long (max 1000 characters)' });
         return;
       }
+
+      if (!useRedis) {
+        socket.emit('chat-error', { message: 'Chat service unavailable' });
+        return;
+      }
       
-      const collection = chatType === 'global' ? 'globalChat' : 'roomChat';
-      const messageRef = db.collection(collection).doc(messageId);
-      const messageDoc = await messageRef.get();
+      let messageData;
       
-      if (!messageDoc.exists) {
+      if (chatType === 'room' && roomId) {
+        const messages = await redisService.getRoomMessages(roomId, 50);
+        messageData = messages.find(msg => msg.id === messageId);
+      } else if (chatType === 'friend' && roomId) {
+        let conversationId = [userId, roomId].sort().join('_');
+        const messages = await redisService.getFriendMessages(conversationId, 50);
+        messageData = messages.find(msg => msg.id === messageId);
+      } else {
+        socket.emit('chat-error', { message: 'Invalid chat type or missing ID' });
+        return;
+      }
+      
+      if (!messageData) {
         socket.emit('chat-error', { message: 'Message not found' });
         return;
       }
       
-      const messageData = messageDoc.data();
-      
       // Check if user owns the message
-      if (messageData.userId !== userId) {
+      const ownerId = chatType === 'friend' ? messageData.senderId : messageData.userId;
+      if (ownerId !== userId) {
         socket.emit('chat-error', { message: 'You can only edit your own messages' });
         return;
       }
       
-      // Check if message is not too old (e.g., within 1 hour)
-      const messageTime = messageData.timestamp?.toDate();
-      const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
-      
-      if (messageTime && messageTime < oneHourAgo) {
-        socket.emit('chat-error', { message: 'Message is too old to edit' });
-        return;
-      }
-      
       // Update message
-      await messageRef.update({
+      const updatedFields = {
         message: newMessage.trim(),
         edited: true,
-        editedAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-      
-      const updatedMessage = {
-        id: messageId,
-        ...messageData,
-        message: newMessage.trim(),
-        edited: true,
-        editedAt: new Date(),
-        timestamp: messageTime
+        editedAt: Date.now()
       };
       
-      // Broadcast edit
-      if (chatType === 'global') {
-        io.emit('message-edited', updatedMessage);
-      } else {
-        io.to(messageData.roomId).emit('message-edited', updatedMessage);
+      const updatedMessage = { ...messageData, ...updatedFields, chatType: chatType };
+      
+      if (chatType === 'room') {
+        await redisService.updateRoomMessage(roomId, messageId, updatedFields);
+        io.to(roomId).emit('message-edited', updatedMessage);
+      } else if (chatType === 'friend') {
+        let conversationId = [userId, roomId].sort().join('_');
+        await redisService.updateFriendMessage(conversationId, messageId, updatedFields);
+        socket.emit('message-edited', updatedMessage);
+        io.to(`user_${messageData.receiverId}`).emit('message-edited', updatedMessage);
       }
       
       socket.emit('edit-success', { messageId: messageId });
@@ -311,42 +253,70 @@ module.exports = ({ socket, io, db }) => {
   // Delete message
   socket.on('delete-message', async (data) => {
     try {
-      const { messageId, chatType } = data;
+      const { messageId, chatType, roomId } = data;
       const userId = socket.userId;
       
       if (!messageId) {
         socket.emit('chat-error', { message: 'Message ID is required' });
         return;
       }
+
+      if (!useRedis) {
+        socket.emit('chat-error', { message: 'Chat service unavailable' });
+        return;
+      }
       
-      const collection = chatType === 'global' ? 'globalChat' : 'roomChat';
-      const messageRef = db.collection(collection).doc(messageId);
-      const messageDoc = await messageRef.get();
+      let messageData;
       
-      if (!messageDoc.exists) {
+      if (chatType === 'room' && roomId) {
+        const messages = await redisService.getRoomMessages(roomId, 50);
+        messageData = messages.find(msg => msg.id === messageId);
+      } else if (chatType === 'friend' && roomId) {
+        let conversationId = [userId, roomId].sort().join('_');
+        const messages = await redisService.getFriendMessages(conversationId, 50);
+        messageData = messages.find(msg => msg.id === messageId);
+      } else {
+        socket.emit('chat-error', { message: 'Invalid chat type or missing ID' });
+        return;
+      }
+      
+      if (!messageData) {
         socket.emit('chat-error', { message: 'Message not found' });
         return;
       }
       
-      const messageData = messageDoc.data();
-      
-      // Check if user owns the message (or is admin - implement as needed)
-      if (messageData.userId !== userId) {
+      // Check if user owns the message
+      const ownerId = chatType === 'friend' ? messageData.senderId : messageData.userId;
+      if (ownerId !== userId) {
         socket.emit('chat-error', { message: 'You can only delete your own messages' });
         return;
       }
       
       // Delete message
-      await messageRef.delete();
-      
-      // Broadcast deletion
-      if (chatType === 'global') {
-        io.emit('message-deleted', { messageId: messageId, chatType: 'global' });
-      } else {
-        io.to(messageData.roomId).emit('message-deleted', { 
+      if (chatType === 'room') {
+        await redisService.deleteRoomMessage(roomId, messageId);
+        io.to(roomId).emit('message-deleted', { 
           messageId: messageId, 
-          roomId: messageData.roomId,
+          roomId: roomId,
           chatType: 'room'
+        });
+        socket.emit('message-deleted', { 
+          messageId: messageId, 
+          roomId: roomId,
+          chatType: 'room'
+        });
+      } else if (chatType === 'friend') {
+        let conversationId = [userId, roomId].sort().join('_');
+        await redisService.deleteFriendMessage(conversationId, messageId);
+        io.to(`user_${messageData.receiverId}`).emit('message-deleted', { 
+          messageId: messageId, 
+          conversationId: conversationId,
+          chatType: 'friend'
+        });
+        socket.emit('message-deleted', { 
+          messageId: messageId, 
+          roomId: roomId,
+          chatType: 'friend'
         });
       }
       
@@ -362,31 +332,33 @@ module.exports = ({ socket, io, db }) => {
   
   // Typing indicator
   socket.on('typing-start', (data) => {
+    // for friend chat roomId is friendId
     const { roomId, chatType } = data;
     const typingData = {
       userId: socket.userId,
       username: socket.username,
-      timestamp: new Date()
+      timestamp: Date.now()
     };
     
-    if (chatType === 'global') {
-      socket.broadcast.emit('user-typing', { ...typingData, chatType: 'global' });
-    } else if (roomId) {
+    if (chatType === 'room' && roomId) {
       socket.to(roomId).emit('user-typing', { ...typingData, roomId: roomId, chatType: 'room' });
+    } else if (chatType === 'friend' && roomId) {
+      io.to(`user_${roomId}`).emit('user-typing', { ...typingData, friendId: socket.userId, chatType: 'friend' });
     }
   });
   
   socket.on('typing-stop', (data) => {
+    // for friend chat roomId is friendId
     const { roomId, chatType } = data;
     const typingData = {
       userId: socket.userId,
       username: socket.username
     };
     
-    if (chatType === 'global') {
-      socket.broadcast.emit('user-stopped-typing', { ...typingData, chatType: 'global' });
-    } else if (roomId) {
+    if (chatType === 'room' && roomId) {
       socket.to(roomId).emit('user-stopped-typing', { ...typingData, roomId: roomId, chatType: 'room' });
+    } else if (chatType === 'friend' && roomId) {
+      io.to(`user_${roomId}`).emit('user-stopped-typing', { ...typingData, friendId: socket.userId, chatType: 'friend' });
     }
   });
 };

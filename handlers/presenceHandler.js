@@ -1,56 +1,19 @@
-// handlers/presenceHandler.js - User Presence Management
-const admin = require('firebase-admin');
-
-module.exports = ({ socket, io, db, activeUsers }) => {
+// handlers/presenceHandler.js - Minimal In-Memory Presence Management
+module.exports = ({ socket, activeUsers }) => {
   
-  // Utility: broadcast online users to everyone
-  const broadcastOnlineUsers = () => {
-    const onlineUsers = Array.from(activeUsers.values())
-      .filter(user => user.status === 'online')
-      .map(user => ({
-        id: user.id,
-        username: user.username,
-        status: user.status,
-        joinedAt: user.joinedAt,
-        lastActivity: user.lastActivity
-      }));
-
-    io.emit('online-users', onlineUsers);
-  };
-
   // Update user presence status
-  socket.on('update-presence', async (data) => {
+  socket.on('update-presence', (data) => {
     try {
       const { status } = data;
       const userId = socket.userId;
       
-      // Update in memory
+      // Update in memory only
       const userData = activeUsers.get(userId);
       if (userData) {
-        userData.status = status;
-        userData.lastActivity = new Date();
+        userData.presence = status;
+        userData.lastActivity = Date.now();
         activeUsers.set(userId, userData);
       }
-      
-      // Update in Firebase
-      await db.collection('userPresence').doc(userId).set({
-        userId: userId,
-        username: socket.username,
-        status: status,
-        lastActivity: admin.firestore.FieldValue.serverTimestamp(),
-        socketId: socket.id
-      }, { merge: true });
-      
-      // Broadcast presence update
-      io.emit('presence-updated', {
-        userId: userId,
-        username: socket.username,
-        status: status,
-        timestamp: new Date()
-      });
-
-      // 🔥 Broadcast the full online users list
-      broadcastOnlineUsers();
       
       socket.emit('presence-update-success', { status });
       
@@ -62,44 +25,54 @@ module.exports = ({ socket, io, db, activeUsers }) => {
     }
   });
   
-  // Get all online users (manual request)
-  socket.on('get-online-users', async () => {
+  // Get specific user's presence
+  socket.on('get-user-presence', (data) => {
     try {
-      broadcastOnlineUsers(); // reuse the utility
-    } catch (error) {
-      console.error('Error getting online users:', error);
-      socket.emit('presence-error', {
-        message: 'Failed to get online users'
+      const { userId } = data;
+      const userData = activeUsers.get(userId);
+      
+      socket.emit('user-presence', {
+        userId,
+        presence: userData ? userData.presence : 'offline',
+        lastActivity: userData ? userData.lastActivity : null
       });
+      
+    } catch (error) {
+      console.error('Error getting user presence:', error);
     }
   });
   
-  // Handle user going idle/away
-  socket.on('user-idle', async () => {
+  // Get multiple users' presence (for friend lists)
+  socket.on('get-users-presence', (data) => {
+    try {
+      const { userIds } = data;
+      const presences = {};
+      
+      userIds.forEach(uid => {
+        const userData = activeUsers.get(uid);
+        presences[uid] = userData ? userData.presence : 'offline';
+      });
+      
+      socket.emit('users-presence', presences);
+      
+    } catch (error) {
+      console.error('Error getting users presence:', error);
+    }
+  });
+  
+  // Handle user going idle
+  socket.on('user-idle', () => {
     try {
       const userId = socket.userId;
       const userData = activeUsers.get(userId);
       
       if (userData) {
-        userData.status = 'idle';
-        userData.lastActivity = new Date();
+        userData.presence = 'idle';
+        userData.lastActivity = Date.now();
         activeUsers.set(userId, userData);
       }
       
-      // Update in Firebase
-      await db.collection('userPresence').doc(userId).update({
-        status: 'idle',
-        lastActivity: admin.firestore.FieldValue.serverTimestamp()
-      });
-      
-      io.emit('user-went-idle', {
-        userId,
-        username: socket.username,
-        timestamp: new Date()
-      });
-
-      // 🔥 Broadcast updated list
-      broadcastOnlineUsers();
+      socket.emit('idle-confirmed', { userId });
       
     } catch (error) {
       console.error('Error setting user idle:', error);
@@ -107,30 +80,18 @@ module.exports = ({ socket, io, db, activeUsers }) => {
   });
   
   // Handle user coming back from idle
-  socket.on('user-active', async () => {
+  socket.on('user-active', () => {
     try {
       const userId = socket.userId;
       const userData = activeUsers.get(userId);
       
       if (userData) {
-        userData.status = 'online';
-        userData.lastActivity = new Date();
+        userData.presence = 'online';
+        userData.lastActivity = Date.now();
         activeUsers.set(userId, userData);
       }
       
-      await db.collection('userPresence').doc(userId).update({
-        status: 'online',
-        lastActivity: admin.firestore.FieldValue.serverTimestamp()
-      });
-
-      io.emit('user-became-active', {
-        userId,
-        username: socket.username,
-        timestamp: new Date()
-      });
-
-      // 🔥 Broadcast updated list
-      broadcastOnlineUsers();
+      socket.emit('active-confirmed', { userId });
       
     } catch (error) {
       console.error('Error setting user active:', error);
@@ -138,82 +99,47 @@ module.exports = ({ socket, io, db, activeUsers }) => {
   });
   
   // Set user presence on connection
-  socket.on('set-initial-presence', async () => {
+  socket.on('set-initial-presence', () => {
     try {
       const userId = socket.userId;
       
       activeUsers.set(userId, {
         id: userId,
         username: socket.username,
-        status: 'online',
-        joinedAt: new Date(),
-        lastActivity: new Date()
+        presence: 'online',
+        joinedAt: Date.now(),
+        lastActivity: Date.now()
       });
-      
-      await db.collection('userPresence').doc(userId).set({
-        userId,
-        username: socket.username,
-        status: 'online',
-        lastActivity: admin.firestore.FieldValue.serverTimestamp(),
-        socketId: socket.id,
-        connectedAt: admin.firestore.FieldValue.serverTimestamp()
-      }, { merge: true });
       
       socket.emit('initial-presence-set', {
         userId,
-        status: 'online'
+        presence: 'online'
       });
-
-      // 🔥 Broadcast updated list
-      broadcastOnlineUsers();
       
     } catch (error) {
       console.error('Error setting initial presence:', error);
     }
   });
-
-  // When socket disconnects
-  socket.on('disconnect', () => {
-    const userId = socket.userId;
-    if (userId && activeUsers.has(userId)) {
-      activeUsers.delete(userId);
-
-      io.emit('user-disconnected', {
-        userId,
-        username: socket.username,
-        timestamp: new Date()
-      });
-
-      // 🔥 Broadcast updated list
-      broadcastOnlineUsers();
-    }
-  });
   
   // Get presence statistics
-  socket.on('get-presence-stats', async () => {
+  socket.on('get-presence-stats', () => {
     try {
-      const onlineCount = Array.from(activeUsers.values())
-        .filter(user => user.status === 'online').length;
+      const stats = { online: 0, idle: 0, away: 0 };
       
-      const idleCount = Array.from(activeUsers.values())
-        .filter(user => user.status === 'idle').length;
-      
-      const awayCount = Array.from(activeUsers.values())
-        .filter(user => user.status === 'away').length;
+      activeUsers.forEach(user => {
+        if (stats[user.presence] !== undefined) {
+          stats[user.presence]++;
+        }
+      });
       
       socket.emit('presence-stats', {
-        online: onlineCount,
-        idle: idleCount,
-        away: awayCount,
+        ...stats,
         total: activeUsers.size,
-        timestamp: new Date()
+        timestamp: Date.now()
       });
       
     } catch (error) {
       console.error('Error getting presence stats:', error);
-      socket.emit('presence-error', {
-        message: 'Failed to get presence statistics'
-      });
     }
   });
 };

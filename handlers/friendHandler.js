@@ -1,4 +1,5 @@
 const admin = require('firebase-admin');
+const achievementService = require('../services/achievementService');
 
 module.exports = ({ socket, io, db, activeUsers }) => {
   const userId = socket.userId;
@@ -8,17 +9,17 @@ module.exports = ({ socket, io, db, activeUsers }) => {
     try {
       if (!targetUserId || targetUserId === userId) return;
 
-      // Add pending request in both users
       await db.collection('userFriends').doc(userId).set({
-        [`friends.${targetUserId}`]: { status: 'pending', addedAt: admin.firestore.FieldValue.serverTimestamp() }
+        [targetUserId]: { senderId: userId, status: 'pending', addedAt: admin.firestore.FieldValue.serverTimestamp() }
       }, { merge: true });
 
       await db.collection('userFriends').doc(targetUserId).set({
-        [`friends.${userId}`]: { status: 'pending', addedAt: admin.firestore.FieldValue.serverTimestamp() }
+        [userId]: { senderId: userId, status: 'pending', addedAt: admin.firestore.FieldValue.serverTimestamp() }
       }, { merge: true });
 
       // Notify target user
-      io.to(activeUsers.get(targetUserId)?.socketId || '').emit('friend-request-received', {
+      console.log(`user_${targetUserId}`)
+      io.to(`user_${targetUserId}`).emit('friend-request-received', {
         from: userId,
         username: socket.username
       });
@@ -35,14 +36,14 @@ module.exports = ({ socket, io, db, activeUsers }) => {
   socket.on('accept-friend-request', async ({ targetUserId }) => {
     try {
       await db.collection('userFriends').doc(userId).update({
-        [`friends.${targetUserId}.status`]: 'accepted'
+        [targetUserId]: {status: 'accepted'}
       });
       await db.collection('userFriends').doc(targetUserId).update({
-        [`friends.${userId}.status`]: 'accepted'
+        [userId]: {status: 'accepted'}
       });
 
       // Notify both users
-      io.to(activeUsers.get(targetUserId)?.socketId || '').emit('friend-request-accepted', {
+      io.to(`user_${targetUserId}`).emit('friend-request-accepted', {
         from: userId,
         username: socket.username
       });
@@ -59,17 +60,18 @@ module.exports = ({ socket, io, db, activeUsers }) => {
   socket.on('remove-friend', async ({ targetUserId }) => {
     try {
       await db.collection('userFriends').doc(userId).update({
-        [`friends.${targetUserId}`]: admin.firestore.FieldValue.delete()
+        [targetUserId]: admin.firestore.FieldValue.delete()
       });
+      
       await db.collection('userFriends').doc(targetUserId).update({
-        [`friends.${userId}`]: admin.firestore.FieldValue.delete()
+        [userId]: admin.firestore.FieldValue.delete()
       });
 
-      io.to(activeUsers.get(targetUserId)?.socketId || '').emit('friend-removed', {
+      io.to(`user_${targetUserId}`).emit('friend-removed', {
         by: userId
       });
 
-      socket.emit('friend-removed', { friendId: targetUserId });
+      socket.emit('friend-remove', { friendId: targetUserId });
 
     } catch (err) {
       console.error('Error removing friend:', err);
@@ -81,8 +83,7 @@ module.exports = ({ socket, io, db, activeUsers }) => {
   socket.on('get-friends', async () => {
     try {
       const doc = await db.collection('userFriends').doc(userId).get();
-      const friends = doc.exists ? doc.data().friends || {} : {};
-
+      const friends = doc.exists ? doc.data() || {} : {};
       const accepted = [];
       const pending = [];
 
@@ -90,18 +91,30 @@ module.exports = ({ socket, io, db, activeUsers }) => {
         const f = friends[fid];
         const onlineUser = activeUsers.get(fid);
         const friendData = {
-          userId: fid,
+          uid: fid,
           status: f.status, // accepted/pending
           addedAt: f.addedAt,
-          presence: onlineUser ? onlineUser.status : 'offline'
+          senderId: f.senderId,
+          presence: onlineUser ? onlineUser.presence : 'offline'
         };
-
+        
         if (f.status === 'accepted') {
           accepted.push(friendData);
         } else if (f.status === 'pending') {
           pending.push(friendData);
         }
       });
+      
+      const result = await achievementService.updateFriendCount(socket.userId, accepted.length);
+      if (result.success && result.achievements.length > 0) {
+        const unlocked = result.achievements.filter(a => a.unlocked);
+        if (unlocked.length > 0) {
+          socket.emit('achievements-unlocked-batch', {
+            achievements: unlocked.map(a => a.achievement),
+            count: unlocked.length
+          });
+        }
+      }
 
       socket.emit('friend-list', {
         accepted,
