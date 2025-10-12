@@ -33,7 +33,8 @@ module.exports = ({ socket, io, db }) => {
         averageScore: 0,
         lastPlayed: null,
         achievements: [],
-        gameTypeScores: {}
+        gameTypeScores: {},
+        currentWinStreak: 0
       };
       
       if (userLeaderboardDoc.exists) {
@@ -120,9 +121,24 @@ module.exports = ({ socket, io, db }) => {
       } = data;
       
       let leaderboard = [];
-      
-      // Fallback to Firebase or for complex queries
-      let query = db.collection('leaderboard');
+      let query = await db.collection('leaderboard'); 
+      // let userAchievement = new Map();
+      // let queryAchievement = await db.collection('userAchievements').where('unlockedAt', '!=', null).get();
+
+      // // create user achievements array
+      // queryAchievement.forEach((doc)=>{
+      //   const data = doc.data();
+      //   const userId = data.userId;
+      //   if (!userAchievement.has(userId)) {
+      //     userAchievement.set(userId, []);
+      //   }
+
+      //   // Push current achievement into that user's array
+      //   userAchievement.get(userId).push({
+      //     id: doc.id,
+      //     ...data,
+      //   });
+      // })
 
       // Timeframe filter (using your existing getTimeLimit function)
       if (timeframe !== 'all') {
@@ -174,7 +190,7 @@ module.exports = ({ socket, io, db }) => {
           losses: data.losses || 0,
           winRate,
           lastPlayed: data.lastPlayed?.toDate(),
-          achievements: data.achievements || [],
+          achievements: data.achievements || [], //userAchievement.get(data.userId)
           gameTypeScores: data.gameTypeScores || {}
         };
       });
@@ -256,6 +272,8 @@ module.exports = ({ socket, io, db }) => {
       
       socket.emit('my-position', {
         position: position,
+        losses: userData.losses,
+        wins: userData.wins,
         totalScore: userData.totalScore,
         gamesPlayed: userData.gamesPlayed,
         averageScore: userData.averageScore,

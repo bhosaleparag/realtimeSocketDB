@@ -51,7 +51,7 @@ admin.initializeApp({
 
 const db = admin.firestore();
 
-achievementService.initializeFirebase(db);
+achievementService.initializeFirebase(admin); 
 
 // Initialize Socket.IO with CORS
 const io = socketIo(server, {
@@ -141,20 +141,6 @@ io.on('connection', async (socket) => {
   
   activeUsers.set(socket.userId, userData);
 
-  // Store user session in Redis
-  if (isRedisAvailable()) {
-    try {
-      await redisService.setPlayerSession(socket.userId, {
-        username: socket.username,
-        socketId: socket.id,
-        presence: 'online',
-        currentRoom: null
-      });
-    } catch (error) {
-      console.error('Error setting player session in Redis:', error);
-    }
-  }
-
   // Join user's personal room for direct messaging
   socket.join(`user_${socket.userId}`);
   
@@ -191,22 +177,8 @@ io.on('connection', async (socket) => {
     
     // Remove from active users
     activeUsers.delete(socket.userId);
-
-    if (isRedisAvailable()) {
-      try {
-        await redisService.setPlayerSession(socket.userId, {
-          username: socket.username,
-          socketId: socket.id,
-          presence: 'offline',
-          currentRoom: null
-        });
-        
-        // Remove from matchmaking queue if present
-        await matchmakingService.removeFromQueue(socket.userId);
-      } catch (error) {
-        console.error('Error updating player session on disconnect:', error);
-      }
-    }
+    // Remove from matchmaking queue if present
+    await matchmakingService.removeFromQueue(socket.userId);
     
     // Broadcast updated user list
     io.emit('user-disconnected', {

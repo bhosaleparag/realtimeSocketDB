@@ -3,6 +3,7 @@ const admin = require('firebase-admin');
 const redisService = require('../services/redisService');
 const matchmakingService = require('../services/matchmakingService');
 const { isRedisAvailable } = require('../config/redis.config');
+const achievementService = require('../services/achievementService');
 
 module.exports = ({ socket, io, db, activeUsers, activeRooms, roomUsers }) => {
   
@@ -66,16 +67,6 @@ module.exports = ({ socket, io, db, activeUsers, activeRooms, roomUsers }) => {
       if (userData) {
         userData.currentRoom = roomId;
         activeUsers.set(userId, userData);
-      }
-      
-      // Update player session in Redis
-      if (useRedis) {
-        await redisService.setPlayerSession(userId, {
-          username: username,
-          socketId: socket.id,
-          status: 'in-room',
-          currentRoom: roomId
-        });
       }
       
       // Track room users
@@ -164,16 +155,6 @@ module.exports = ({ socket, io, db, activeUsers, activeRooms, roomUsers }) => {
         activeUsers.set(userId, userData);
       }
       
-      // Update player session in Redis
-      if (useRedis) {
-        await redisService.setPlayerSession(userId, {
-          username: username,
-          socketId: socket.id,
-          status: 'in-room',
-          currentRoom: roomId
-        });
-      }
-      
       // Track room users
       let roomUserSet = roomUsers.get(roomId);
       if (!roomUserSet) {
@@ -207,110 +188,406 @@ module.exports = ({ socket, io, db, activeUsers, activeRooms, roomUsers }) => {
       });
     }
   });
-  
-  // Leave room
+
+  // ==================== LEAVE ROOM HANDLER ====================
   socket.on('leave-room', async (data) => {
     try {
       const { roomId } = data;
       const userId = socket.userId;
       const username = socket.username;
-      
+
       if (!roomId) {
         socket.emit('room-error', { message: 'Room ID is required' });
         return;
       }
 
-      // Get room from Redis
+      // Fetch room data
       let roomData = null;
       if (useRedis) {
         roomData = await redisService.getRoom(roomId);
       }
 
+      // Handle case where room doesn't exist or was already deleted
+      if (!roomData) {
+        socket.emit('room-left', {
+          roomId: roomId,
+          message: 'Room not found or already closed'
+        });
+        
+        // Clean up user's room reference
+        const userData = activeUsers.get(userId);
+        if (userData) {
+          userData.currentRoom = null;
+          activeUsers.set(userId, userData);
+        }
+        return;
+      }
+
+      // Check if user is in the room
       if (!roomData.participants.includes(userId)) {
         socket.emit('room-error', { message: 'You are not in this room' });
         return;
       }
-      
+
       // Leave socket room
       socket.leave(roomId);
-      
-      // Remove from room users set
+
+      // Remove from room tracking
       const roomUserSet = roomUsers.get(roomId);
       if (roomUserSet) {
         roomUserSet.delete(userId);
       }
-      
-      // Update user's current room
+
+      // Update active user data
       const userData = activeUsers.get(userId);
       if (userData) {
         userData.currentRoom = null;
         activeUsers.set(userId, userData);
       }
-      
-      // Update player session in Redis
-      if (useRedis) {
-        await redisService.setPlayerSession(userId, {
-          username: username,
-          socketId: socket.id,
-          status: 'online',
-          currentRoom: null
-        });
-      }
-      
-      // Remove player from room in Redis
+
+      // Remove player from Redis room
       let roomDeleted = false;
+      let remainingPlayers = [];
+      
       if (useRedis) {
         const result = await redisService.removePlayerFromRoom(roomId, userId);
         roomDeleted = result.roomDeleted;
+        
+        // Refresh room data if not deleted
         if (!roomDeleted) {
           roomData = await redisService.getRoom(roomId);
+          remainingPlayers = roomData.participantDetails;
         }
       }
-      
-      // Update Firebase
-      if (roomDeleted) {
-        io.emit('room-deleted', { roomId: roomId });
-      } else {
-        const updatedParticipantDetails = roomData.participantDetails.filter(p => p.userId !== userId);
-        
-        const updateData = {
-          participants: admin.firestore.FieldValue.arrayRemove(userId),
-          participantDetails: updatedParticipantDetails,
-          currentPlayers: admin.firestore.FieldValue.increment(-1),
-          lastActivity: admin.firestore.FieldValue.serverTimestamp()
-        };
-        
-        if (roomData.createdBy === userId && updatedParticipantDetails.length > 0) {
-          updateData.createdBy = updatedParticipantDetails[0].userId;
-          updateData.creatorUsername = updatedParticipantDetails[0].username;
-        }
 
-        socket.to(roomId).emit('user-left-room', {
-          userId: userId,
-          username: username,
+      // CASE 1: Room was deleted (last player left) OR only 1 player remains
+      // In multiplayer, if one player leaves, the other should win by forfeit
+      if (roomDeleted || remainingPlayers.length === 1) {
+        console.log(`Player left room ${roomId} - ending game (${roomDeleted ? 'room empty' : 'only 1 player left'})`);
+        
+        // If there's still 1 player, they win by forfeit
+        if (remainingPlayers.length === 1) {
+          const winner = remainingPlayers[0];
+          
+          // Give winner their points
+          await handleGameFinished(roomId, {
+            ...roomData,
+            participantDetails: [
+              { ...winner, score: winner.score || 50 }, // Winner gets points
+              { 
+                userId: userId, 
+                username: username, 
+                score: 0 // Leaving player gets 0
+              }
+            ]
+          }, {
+            reason: 'player-forfeit',
+            triggeredBy: 'player-left',
+            forfeitedBy: userId,
+            winnerId: winner.userId
+          });
+        }
+        
+        // Notify the leaving player
+        socket.emit('room-left', {
           roomId: roomId,
-          currentPlayers: roomData.currentPlayers
+          message: 'Left room successfully',
+          roomDeleted: true,
+          forfeit: true
         });
         
-        io.emit('room-updated', {
-          roomId: roomId,
-          currentPlayers: roomData.currentPlayers,
-          maxPlayers: roomData.maxPlayers
-        });
+        return;
       }
-      
+
+      // CASE 2: Room has 2+ players remaining (shouldn't happen in 1v1 but kept for safety)
+      // Notify other players that someone left
+      socket.to(roomId).emit('user-left-room', {
+        userId: userId,
+        username: username,
+        roomId: roomId,
+        currentPlayers: remainingPlayers.length
+      });
+
+      // Notify lobby about room update
+      io.emit('room-updated', {
+        roomId: roomId,
+        currentPlayers: remainingPlayers.length,
+        maxPlayers: roomData.maxPlayers
+      });
+
+      // Confirm to leaving user
       socket.emit('room-left', {
         roomId: roomId,
-        message: 'Left room successfully'
+        message: 'Left room successfully',
+        roomDeleted: false
       });
-      
+
     } catch (error) {
       console.error('Error leaving room:', error);
       socket.emit('room-error', {
-        message: 'Failed to leave room'
+        message: 'Failed to leave room',
+        error: error.message
       });
     }
   });
+
+  // ==================== GAME FINISHED HELPER ====================
+  async function handleGameFinished(roomId, roomData, finishContext = {}) {
+    try {
+      // Update room status in Redis
+      if (useRedis) {
+        await redisService.updateRoom(roomId, {
+          status: 'finished',
+          gameFinishedAt: Date.now()
+        });
+      }
+      
+      // If room is empty or has no valid participants, just clean up
+      if (!roomData || !roomData.participantDetails || roomData.participantDetails.length === 0) {
+        
+        // Clean up room
+        if (useRedis) {
+          await redisService.deleteRoom(roomId);
+        }
+        io.emit('room-deleted', { roomId: roomId });
+        return;
+      }
+
+      // Sort participants by score
+      const finalScores = roomData.participantDetails
+        .sort((a, b) => (b.score || 0) - (a.score || 0))
+        .map((p, index) => ({
+          ...p,
+          rank: index + 1,
+          isWinner: index === 0
+        }));
+
+      // Determine winners (handle ties)
+      const highestScore = finalScores[0]?.score || 0;
+      const winners = finalScores.filter(p => p.score === highestScore);
+
+      const gameType = roomData.gameSettings?.mode || 'quiz';
+
+      // Prepare all player results
+      const playerResults = finalScores.map(participant => {
+        let result = 'loss';
+        if (winners.some(w => w.userId === participant.userId)) {
+          result = winners.length > 1 ? 'draw' : 'win';
+        }
+
+        return {
+          userId: participant.userId,
+          username: participant.username,
+          result: result,
+          finalScore: participant.score || 0,
+          rank: participant.rank,
+          totalParticipants: finalScores.length,
+          points: participant.score || 0
+        };
+      });
+
+      // Use a single batch for ALL Firebase operations
+      const batch = db.batch();
+
+      for (const participant of finalScores) {
+        const userId = participant.userId;
+        const userScore = participant.score || 0;
+
+        // Determine result for this participant
+        let result = 'loss';
+        if (winners.some(w => w.userId === userId)) {
+          result = winners.length > 1 ? 'draw' : 'win';
+        }
+
+        // 1. GET CURRENT LEADERBOARD DATA
+        const userLeaderboardRef = db.collection('leaderboard').doc(userId);
+        const userDoc = await userLeaderboardRef.get();
+        
+        let currentLeaderboardData = {
+          userId: userId,
+          username: participant.username,
+          totalScore: 0,
+          gamesPlayed: 0,
+          wins: 0, losses: 0,
+          gameTypeScores: {},
+          currentWinStreak: 0,
+          perfectGames: 0,
+        };
+        
+        if (userDoc.exists) {
+          currentLeaderboardData = { ...currentLeaderboardData, ...userDoc.data() };
+        }
+
+        // Calculate new leaderboard values
+        const newTotalScore = currentLeaderboardData.totalScore + userScore;
+        const newGamesPlayed = currentLeaderboardData.gamesPlayed + 1;
+        const newAverageScore = newTotalScore / newGamesPlayed;
+
+        // Update game type scores
+        const gameTypeScores = currentLeaderboardData.gameTypeScores || {};
+        gameTypeScores[gameType] = {
+          score: (gameTypeScores[gameType]?.score || 0) + userScore,
+          gamesPlayed: (gameTypeScores[gameType]?.gamesPlayed || 0) + 1
+        };
+
+        // Update wins/losses and currentWinStreak
+        let wins = currentLeaderboardData.wins || 0;
+        let losses = currentLeaderboardData.losses || 0;
+        let currentWinStreak = currentLeaderboardData.currentWinStreak || 0;
+        
+        if (result === 'win') {
+          wins += 1;
+          currentWinStreak += 1;
+        } else if (result === 'loss') {
+          losses += 1;
+          currentWinStreak = 0;
+        }
+        
+        // Update perfect game 
+        let perfectGames = currentLeaderboardData.perfectGames || 0;
+        if(roomData.perfectScore === userScore){
+          perfectGames+=1
+        }
+
+        // Add leaderboard update to batch
+        batch.set(userLeaderboardRef, {
+          userId: userId,
+          username: participant.username,
+          totalScore: newTotalScore,
+          gamesPlayed: newGamesPlayed,
+          averageScore: Math.round(newAverageScore * 100) / 100,
+          wins: wins, losses: losses,
+          currentWinStreak: currentWinStreak,
+          gameTypeScores: gameTypeScores,
+          perfectGames: perfectGames,
+          lastPlayed: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+
+        // 2. GET CURRENT USER STATS
+        const userRef = db.collection('users').doc(userId);
+        const userSnapshot = await userRef.get();
+        
+        let currentUserStats = {
+          battlesWon: 0, quizzesTaken: 0, streak: 0, xp: 0
+        };
+
+        if (userSnapshot.exists && userSnapshot.data().stats) {
+          currentUserStats = { ...currentUserStats, ...userSnapshot.data().stats };
+        }
+
+        // Calculate streak
+        let newStreak = currentUserStats.streak || 0;
+        if (result === 'win') {
+          newStreak += 1;
+        } else if (result === 'loss') {
+          newStreak = 0;
+        }
+
+        // Add user stats update to batch
+        batch.set(userRef, {
+          stats: {
+            battlesWon: (currentUserStats.battlesWon || 0) + (result === 'win' ? 1 : 0),
+            quizzesTaken: (currentUserStats.quizzesTaken || 0) + 1,
+            streak: newStreak,
+            xp: (currentUserStats.xp || 0) + userScore
+          },
+          lastPlayedAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+
+        // 3. ADD GAME RESULT TO BATCH
+        const gameResultRef = db.collection('gameResults').doc();
+        batch.set(gameResultRef, {
+          userId: participant.userId,
+          username: participant.username,
+          result: result,
+          roomId: roomId,
+          finalScore: participant.score || 0,
+          rank: participant.rank,
+          gameType: gameType,
+          timestamp: admin.firestore.FieldValue.serverTimestamp()
+        });
+      }
+
+      await batch.commit();
+
+      // Broadcast game finished to all players in room
+      io.to(roomId).emit('game-finished', {
+        roomId: roomId,
+        finalScores: finalScores,
+        winners: winners.map(w => w.userId),
+        gameType: gameType,
+        allPlayerResults: playerResults,
+        finishReason: finishContext.reason || 'completed',
+        timestamp: Date.now()
+      });
+
+      // ============ CHECK ACHIEVEMENTS FOR ALL PLAYERS ============
+      for (const participant of finalScores) {
+        const userId = participant.userId;
+        
+        // Get updated user stats for achievement checking
+        const userLeaderboardDoc = await db.collection('leaderboard').doc(userId).get();
+        
+        if (userLeaderboardDoc.exists) {
+          const userStats = userLeaderboardDoc.data();
+          
+          // Check and unlock achievements
+          const achievementResult = await achievementService.checkAndUnlockAchievements(userId, userStats);
+          
+          if (achievementResult.success && achievementResult.newlyUnlocked.length > 0) {
+            // Find player's socket
+            const playerSocket = Array.from(io.sockets.sockets.values()).find(
+              s => s.userId === userId
+            );
+            
+            if (playerSocket) {
+              // Notify this player of unlocked achievements
+              playerSocket.emit('achievements-unlocked-batch', {
+                achievements: achievementResult.newlyUnlocked,
+                count: achievementResult.count,
+                timestamp: new Date()
+              });
+            }
+            
+            // Broadcast to all users
+            for (const achievement of achievementResult.newlyUnlocked) {
+              io.emit('user-achievement-unlocked', {
+                userId: userId,
+                username: participant.username,
+                achievement: achievement,
+                timestamp: new Date()
+              });
+            }
+            
+            // Update user's achievement points (separate from batch to avoid conflicts)
+            const totalPoints = achievementResult.newlyUnlocked.reduce((sum, a) => sum + (a.points || 0), 0);
+            await db.collection('users').doc(userId).update({
+              achievementPoints: admin.firestore.FieldValue.increment(totalPoints),
+              totalAchievements: admin.firestore.FieldValue.increment(achievementResult.count),
+              lastAchievementUnlockedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+          }
+        }
+      }
+
+      // Clean up room from Redis and notify lobby
+      if (useRedis) {
+        await redisService.deleteRoom(roomId);
+      }
+      io.emit('room-deleted', { roomId: roomId });
+
+    } catch (error) {
+      console.error('Error handling game-finished:', error);
+      
+      // Notify players about error
+      io.to(roomId).emit('game-error', {
+        message: 'Error finalizing game results',
+        error: error.message
+      });
+    }
+  }
   
   // Get available rooms
   socket.on('get-available-rooms', async (data) => {
@@ -436,54 +713,71 @@ module.exports = ({ socket, io, db, activeUsers, activeRooms, roomUsers }) => {
         await redisService.addGameEvent(roomId, gameEvent);
       }
       
-      // Broadcast to room
-      io.to(roomId).emit('game-event-received', gameEvent);
-      
       // Handle specific event types
       switch (eventType) {
+        case 'test-case-passed':
         case 'bug-solved':
-        case 'question-answered':
-        case 'challenge-completed':
           const points = eventData.points || 10;
-          const updatedParticipantDetails = roomData.participantDetails.map(p => {
-            if (p.userId === userId) {
-              return { ...p, score: (p.score || 0) + points };
-            }
-            return p;
-          });
+          const prevScore = roomData.participantDetails.find(p => p.userId === userId)?.score || 0;
 
-          // Update room in Redis
-          if (useRedis) {
-            await redisService.updateRoom(roomId, { 
-              participantDetails: updatedParticipantDetails 
+          // Only update if score increased
+          if (points > prevScore) {
+            const updatedParticipantDetails = roomData.participantDetails.map(p => 
+              p.userId === userId ? { ...p, score: points } : p
+            );
+
+            if (useRedis) {
+              await redisService.updateRoom(roomId, { participantDetails: updatedParticipantDetails });
+            }
+            
+            io.to(roomId).emit('score-updated', {
+              userId, username,
+              newScore: points, points,
+              reason: eventType
             });
+            
+            if (useRedis) {
+              try {
+                await redisService.updateLeaderboard(userId, points, 'global');
+                const gameType = roomData.gameSettings?.mode || 'general';
+                await redisService.updateLeaderboard(userId, points, `gametype:${gameType}`);
+              } catch (redisError) {
+                console.error('Redis leaderboard update failed (non-critical):', redisError);
+              }
+            }
+          }
+          break;
+
+        case 'question-answered':
+          const qaPoints = eventData.points || 10;
+          const updatedQADetails = roomData.participantDetails.map(p => 
+            p.userId === userId ? { ...p, score: (p.score || 0) + qaPoints } : p
+          );
+
+          if (useRedis) {
+            await redisService.updateRoom(roomId, { participantDetails: updatedQADetails });
           }
           
-          const newScore = updatedParticipantDetails.find(p => p.userId === userId).score;
-          
-          // Broadcast score update to room
+          const qaNewScore = updatedQADetails.find(p => p.userId === userId).score;
           io.to(roomId).emit('score-updated', {
-            userId: userId,
-            username: username,
-            newScore: newScore,
-            points: points,
+            userId,
+            username,
+            newScore: qaNewScore,
+            points: qaPoints,
             reason: eventType
           });
           
-          // Update real-time leaderboard in Redis
           if (useRedis) {
             try {
-              await redisService.updateLeaderboard(userId, newScore, 'global');
-              
-              // Update game-type specific leaderboard
+              await redisService.updateLeaderboard(userId, qaNewScore, 'global');
               const gameType = roomData.gameSettings?.mode || 'general';
-              await redisService.updateLeaderboard(userId, newScore, `gametype:${gameType}`);
+              await redisService.updateLeaderboard(userId, qaNewScore, `gametype:${gameType}`);
             } catch (redisError) {
               console.error('Redis leaderboard update failed (non-critical):', redisError);
             }
           }
           break;
-          
+
         case 'timer-update':
           io.to(roomId).emit('timer-updated', {
             timeRemaining: eventData.timeRemaining,
@@ -492,241 +786,12 @@ module.exports = ({ socket, io, db, activeUsers, activeRooms, roomUsers }) => {
           break;
           
         case 'game-finished':
-          // Update room status
-          if (useRedis) {
-            await redisService.updateRoom(roomId, {
-              status: 'finished',
-              gameFinishedAt: Date.now()
-            });
-          }
-
-          // Sort participants by score
-          const finalScores = roomData.participantDetails
-            .sort((a, b) => (b.score || 0) - (a.score || 0))
-            .map((p, index) => ({
-              ...p,
-              rank: index + 1,
-              isWinner: index === 0
-            }));
-          
-          // Determine winners
-          const highestScore = finalScores[0]?.score || 0;
-          const winners = finalScores.filter(p => p.score === highestScore);
-          
-          // Update leaderboard and record results for all participants
-          const gameType = roomData.gameSettings?.mode || 'general';
-          const bulkLeaderboardUpdates = [];
-          const playerResults = [];
-          
-          for (const participant of finalScores) {
-            // Determine result
-            let result = 'loss';
-            if (winners.some(w => w.userId === participant.userId)) {
-              result = winners.length > 1 ? 'draw' : 'win';
-            }
-            
-            // Prepare Firebase leaderboard update
-            bulkLeaderboardUpdates.push({
-              userId: participant.userId,
-              username: participant.username,
-              points: participant.score || 0,
-              result: result,
-              gameType: gameType
-            });
-            
-            playerResults.push({
-              userId: participant.userId,
-              username: participant.username,
-              result: result,
-              finalScore: participant.score || 0,
-              rank: participant.rank,
-              totalParticipants: finalScores.length,
-              points: participant.score || 0
-            });
-            
-            // Record individual game result
-            db.collection('gameResults').add({
-              userId: participant.userId,
-              username: participant.username,
-              result: result,
-              roomId: roomId,
-              finalScore: participant.score || 0,
-              rank: participant.rank,
-              gameType: gameType,
-              timestamp: admin.firestore.FieldValue.serverTimestamp()
-            }).catch(err => console.error('Error saving game result:', err));
-          }
-          
-          // Batch update Firebase leaderboard AND user stats
-          const batch = db.batch();
-          
-          for (const participant of finalScores) {
-            const userId = participant.userId;
-            const userScore = participant.score || 0;
-            
-            // Determine result for this participant
-            let result = 'loss';
-            if (winners.some(w => w.userId === userId)) {
-              result = winners.length > 1 ? 'draw' : 'win';
-            }
-            
-            // 1. UPDATE LEADERBOARD
-            const userLeaderboardRef = db.collection('leaderboard').doc(userId);
-            const userDoc = await userLeaderboardRef.get();
-            let currentData = {
-              userId: userId,
-              username: participant.username,
-              totalScore: 0,
-              gamesPlayed: 0,
-              wins: 0,
-              losses: 0,
-              gameTypeScores: {}
-            };
-            
-            if (userDoc.exists) {
-              currentData = { ...currentData, ...userDoc.data() };
-            }
-            
-            // Calculate new values
-            const newTotalScore = currentData.totalScore + userScore;
-            const newGamesPlayed = currentData.gamesPlayed + 1;
-            const newAverageScore = newTotalScore / newGamesPlayed;
-            
-            // Update game type scores
-            const gameTypeScores = currentData.gameTypeScores || {};
-            gameTypeScores[gameType] = {
-              score: (gameTypeScores[gameType]?.score || 0) + userScore,
-              gamesPlayed: (gameTypeScores[gameType]?.gamesPlayed || 0) + 1
-            };
-            
-            // Update wins/losses
-            let wins = currentData.wins || 0;
-            let losses = currentData.losses || 0;
-            
-            if (result === 'win') {
-              wins += 1;
-            } else if (result === 'loss') {
-              losses += 1;
-            }
-            
-            batch.set(userLeaderboardRef, {
-              userId: userId, wins: wins, losses: losses,
-              username: participant.username,
-              totalScore: newTotalScore,
-              gamesPlayed: newGamesPlayed,
-              averageScore: Math.round(newAverageScore * 100) / 100,
-              gameTypeScores: gameTypeScores,
-              lastPlayed: admin.firestore.FieldValue.serverTimestamp(),
-              updatedAt: admin.firestore.FieldValue.serverTimestamp()
-            }, { merge: true });
-
-            // 2. UPDATE USER STATS IN 'users' COLLECTION
-            const userRef = db.collection('users').doc(userId);
-            
-            // Get current user data
-            const userSnapshot = await userRef.get();
-            let currentUserStats = { battlesWon: 0, quizzesTaken: 0, streak: 0, xp: 0 };
-            
-            if (userSnapshot.exists && userSnapshot.data().stats) {
-              currentUserStats = { ...currentUserStats, ...userSnapshot.data().stats };
-            }
-            
-            // Calculate streak
-            let newStreak = currentUserStats.streak || 0;
-            if (result === 'win') {
-              newStreak += 1; // Increment streak on win
-            } else if (result === 'loss') {
-              newStreak = 0; // Reset streak on loss
-            }
-            
-            batch.set(userRef, {
-              stats: {
-                battlesWon: (currentUserStats.battlesWon || 0) + (result === 'win' ? 1 : 0),
-                quizzesTaken: (currentUserStats.quizzesTaken || 0) + 1,
-                streak: newStreak,
-                xp: (currentUserStats.xp || 0) + userScore
-              },
-              lastPlayedAt: admin.firestore.FieldValue.serverTimestamp(),
-              updatedAt: admin.firestore.FieldValue.serverTimestamp()
-            }, { merge: true });
-          }
-          
-          // Commit batch update to Firebase
-          await batch.commit().catch(err => {
-            console.error('Error committing batch update:', err);
+          await handleGameFinished(roomId, roomData, {
+            reason: eventData?.reason || 'completed',
+            triggeredBy: eventData?.triggeredBy || 'game-event'
           });
-          
-          // Broadcast game finished event to ALL players in room at once
-          io.to(roomId).emit('game-finished', {
-            roomId: roomId,
-            finalScores: finalScores,
-            winners: winners.map(w => w.userId),
-            gameType: gameType,
-            allPlayerResults: playerResults,
-            timestamp: Date.now()
-          });
-          
-          // Broadcast final leaderboard update
-          io.emit('leaderboard-updated', {
-            roomId: roomId,
-            updates: bulkLeaderboardUpdates,
-            timestamp: new Date()
-          });
-          
-          // Delay room cleanup by 5 seconds
-          setTimeout(async () => {
-            // Clean up room
-            try {
-              if (useRedis) {
-                await redisService.deleteRoom(roomId);
-              }
-              io.emit('room-deleted', { roomId: roomId });
-            } catch (cleanupError) {
-              console.error('Error cleaning up finished room:', cleanupError);
-            }
-          }, 5000);
-          
           break;
 
-        case 'player-surrender':
-          // Mark player as surrendered
-          const surrenderedParticipants = roomData.participantDetails.map(p => {
-            if (p.userId === userId) {
-              return { ...p, surrendered: true, surrenderedAt: Date.now() };
-            }
-            return p;
-          });
-          
-          if (useRedis) {
-            await redisService.updateRoom(roomId, { 
-              participantDetails: surrenderedParticipants 
-            });
-          }
-          
-          io.to(roomId).emit('player-surrendered', {
-            userId: userId,
-            username: username,
-            roomId: roomId
-          });
-          
-          // Check if all players surrendered or only one remains
-          const activePlayers = surrenderedParticipants.filter(p => !p.surrendered);
-          if (activePlayers.length <= 1) {
-            // Auto-finish game - recursively trigger game-finished
-            const finishGameEvent = {
-              roomId: roomId,
-              eventType: 'game-finished',
-              eventData: { 
-                reason: 'auto-finished',
-                triggeredBy: 'player-surrender' 
-              }
-            };
-            roomData.participantDetails = surrenderedParticipants
-            // Manually trigger the game-finished case by emitting the event
-            socket.emit('game-event', finishGameEvent)
-          }
-          break;
-          
         case 'hint-used':
           // Track hint usage (optional - for analytics)
           await db.collection('gameAnalytics').add({
@@ -826,8 +891,8 @@ module.exports = ({ socket, io, db, activeUsers, activeRooms, roomUsers }) => {
       const userId = socket.userId;
       const username = socket.username;
       const { skillLevel = 1000, gameSettings } = data;
-      
-      const result = await matchmakingService.quickMatch(userId, {username, skillLevel});
+
+      const result = await matchmakingService.quickMatch(userId, {username, skillLevel, perfectScore: gameSettings?.xp || 50 });
       
       if (result.matched) {
         // Join both players to the created room

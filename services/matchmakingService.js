@@ -63,16 +63,20 @@ class MatchmakingService {
       }
       
       const skillLevel = parseInt(playerData.skillLevel);
-      const skillRange = options.skillRange || 200; // Skill range for matching
+      const skillRange = options.skillRange || 1000; // Skill range for matching
       
       // Find players within skill range
       const minSkill = skillLevel - skillRange;
       const maxSkill = skillLevel + skillRange;
-      
-      const potentialMatches = await redisClient.zrangebyscore(
-        queueKey,
-        minSkill,
-        maxSkill
+
+      // remove for temperary because limited users
+      // const potentialMatches = await redisClient.zrangebyscore(
+      //   queueKey,
+      //   minSkill,
+      //   maxSkill
+      // );
+      const potentialMatches = await redisClient.zrange(
+        queueKey, 0, -1
       );
       
       // Remove self from potential matches
@@ -237,6 +241,7 @@ class MatchmakingService {
           maxPlayers: 2,
           currentPlayers: 2,
           participants: [userId, matchResult.opponent.userId],
+          perfectScore: userProfile.perfectScore,
           participantDetails: [
             {
               userId: userId,

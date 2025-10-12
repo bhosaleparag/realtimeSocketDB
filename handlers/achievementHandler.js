@@ -104,12 +104,12 @@ module.exports = ({ socket, io, db }) => {
   socket.on('update-daily-streak', async (data) => {
     try {
       const { userId, currentStreak } = data;
+      console.log(userId, currentStreak)
       
       // Verify user
       if (socket.userId !== userId) {
         return socket.emit('achievement-error', { message: 'Unauthorized' });
       }
-      
       const result = await achievementService.updateDailyStreak(userId, currentStreak);
       
       if (result.success && result.achievements.length > 0) {

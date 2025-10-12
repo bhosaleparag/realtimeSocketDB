@@ -273,57 +273,6 @@ class RedisService {
     }
   }
   
-  // ============ PLAYER SESSION OPERATIONS ============
-  
-  async setPlayerSession(userId, sessionData) {
-    try {
-      const sessionKey = `${KEY_PREFIXES.PLAYER_SESSION}${userId}`;
-      await redisClient.hset(sessionKey, {
-        userId: userId,
-        username: sessionData.username,
-        socketId: sessionData.socketId,
-        status: sessionData.status || 'online',
-        currentRoom: sessionData.currentRoom || '',
-        lastSeen: Date.now(),
-      });
-      await redisClient.expire(sessionKey, TTL.PLAYER_SESSION);
-      return { success: true };
-    } catch (error) {
-      console.error('Redis setPlayerSession error:', error);
-      throw error;
-    }
-  }
-  
-  async getPlayerSession(userId) {
-    try {
-      const sessionKey = `${KEY_PREFIXES.PLAYER_SESSION}${userId}`;
-      const session = await redisClient.hgetall(sessionKey);
-      
-      if (!session || Object.keys(session).length === 0) {
-        return null;
-      }
-      
-      return {
-        ...session,
-        lastSeen: parseInt(session.lastSeen),
-      };
-    } catch (error) {
-      console.error('Redis getPlayerSession error:', error);
-      return null;
-    }
-  }
-  
-  async deletePlayerSession(userId) {
-    try {
-      const sessionKey = `${KEY_PREFIXES.PLAYER_SESSION}${userId}`;
-      await redisClient.del(sessionKey);
-      return { success: true };
-    } catch (error) {
-      console.error('Redis deletePlayerSession error:', error);
-      throw error;
-    }
-  }
-  
   // ============ GAME STATE OPERATIONS ============
   
   async setGameState(roomId, gameState) {

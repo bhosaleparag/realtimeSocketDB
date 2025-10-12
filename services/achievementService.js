@@ -1,6 +1,5 @@
 // services/achievementService.js - Achievement Management with In-Memory Cache & Firebase
 const { redisClient, KEY_PREFIXES, TTL, isRedisAvailable } = require('../config/redis.config');
-
 class AchievementService {
   
   constructor() {
@@ -14,10 +13,15 @@ class AchievementService {
   }
   
   // Initialize Firebase connection
-  initializeFirebase(db) {
-    this.db = db;
-    console.log('✅ AchievementService: Firebase initialized');
+  initializeFirebase(adminInstance) {
+    if (!adminInstance) {
+      throw new Error("Firebase Admin SDK instance must be provided.");
+    }
+    this.admin = adminInstance;
+    this.db = adminInstance.firestore();
+    console.log("AchievementService initialized with Firebase.");
   }
+
   
   // Helper to ensure db is initialized
   ensureDb() {
@@ -96,6 +100,73 @@ class AchievementService {
     } catch (error) {
       console.error('Error getting achievements:', error);
       return [];
+    }
+  }
+
+  async updateAchievementProgress(userId, achievementId, progress) {
+    try {
+      const db = this.ensureDb();
+      
+      // Find existing user achievement
+      const snapshot = await db.collection('userAchievements')
+        .where('userId', '==', userId)
+        .where('achievementId', '==', achievementId)
+        .limit(1)
+        .get();
+      
+      if (snapshot.empty) {
+        // Create new progress entry
+        await db.collection('userAchievements').add({
+          userId: userId,
+          achievementId: achievementId,
+          unlockedAt: null,
+          progress: progress
+        });
+      } else {
+        const doc = snapshot.docs[0];
+        const data = doc.data();
+        
+        // Update existing progress
+        await doc.ref.update({ progress: progress });
+        
+        // Auto-unlock if progress reaches 100%
+        if (progress >= 100 && !data.unlockedAt) {
+          await doc.ref.update({
+            unlockedAt: this.admin.firestore.FieldValue.serverTimestamp()
+          });
+          
+          // Invalidate cache
+          this.userAchievementsCache.delete(userId);
+          if (isRedisAvailable()) {
+            await redisClient.del(`${KEY_PREFIXES.USER_ACHIEVEMENTS}:${userId}`);
+          }
+          
+          return {
+            success: true,
+            unlocked: true,
+            progress: progress
+          };
+        }
+      }
+      
+      // Invalidate cache
+      this.userAchievementsCache.delete(userId);
+      if (isRedisAvailable()) {
+        await redisClient.del(`${KEY_PREFIXES.USER_ACHIEVEMENTS}:${userId}`);
+      }
+      
+      return {
+        success: true,
+        unlocked: false,
+        progress: progress
+      };
+      
+    } catch (error) {
+      console.error('Error updating achievement progress:', error);
+      return { 
+        success: false, 
+        message: 'Failed to update progress' 
+      };
     }
   }
   
@@ -226,7 +297,6 @@ class AchievementService {
   async unlockAchievement(userId, achievementId) {
     try {
       const db = this.ensureDb();
-      const admin = require('firebase-admin');
       
       // Check if user already has this achievement
       const existingSnapshot = await db.collection('userAchievements')
@@ -257,7 +327,7 @@ class AchievementService {
       const userAchievementRef = await db.collection('userAchievements').add({
         userId: userId,
         achievementId: achievementId,
-        unlockedAt: admin.firestore.FieldValue.serverTimestamp(),
+        unlockedAt: this.admin.firestore.FieldValue.serverTimestamp(),
         progress: 100
       });
       
@@ -284,70 +354,138 @@ class AchievementService {
     }
   }
   
-  async updateAchievementProgress(userId, achievementId, progress) {
+  async checkAndUnlockAchievements(userId, userStats) {
     try {
       const db = this.ensureDb();
-      const admin = require('firebase-admin');
+      const allAchievements = await this.getAllAchievements();
+      const userAchievements = await this.getUserAchievements(userId);
+      const unlockedIds = new Set(userAchievements.map(ua => ua.achievementId));
       
-      // Find existing user achievement
-      const snapshot = await db.collection('userAchievements')
-        .where('userId', '==', userId)
-        .where('achievementId', '==', achievementId)
-        .limit(1)
-        .get();
+      // Create maps for existing achievements by achievementId
+      const existingAchievementsMap = new Map();
+      userAchievements.forEach(ua => {
+        existingAchievementsMap.set(ua.achievementId, ua);
+      });
       
-      if (snapshot.empty) {
-        // Create new progress entry
-        await db.collection('userAchievements').add({
-          userId: userId,
-          achievementId: achievementId,
-          unlockedAt: null,
-          progress: progress
-        });
-      } else {
-        const doc = snapshot.docs[0];
-        const data = doc.data();
+      const newlyUnlocked = [];
+      const batch = db.batch();
+      let batchCount = 0;
+      const MAX_BATCH_SIZE = 500; // Firestore batch limit
+      let totalPointsEarned = 0;
+      
+      for (const achievement of allAchievements) {
+        const meetsCriteria = this.checkAchievementCriteria(achievement, userStats);
+        const existingAchievement = existingAchievementsMap.get(achievement.achievementId);
         
-        // Update existing progress
-        await doc.ref.update({ progress: progress });
-        
-        // Auto-unlock if progress reaches 100%
-        if (progress >= 100 && !data.unlockedAt) {
-          await doc.ref.update({
-            unlockedAt: admin.firestore.FieldValue.serverTimestamp()
-          });
-          
-          // Invalidate cache
-          this.userAchievementsCache.delete(userId);
-          if (isRedisAvailable()) {
-            await redisClient.del(`${KEY_PREFIXES.USER_ACHIEVEMENTS}:${userId}`);
+        // Case 1: Achievement meets criteria and not yet unlocked
+        if (meetsCriteria.met && !unlockedIds.has(achievement.achievementId)) {
+          if (existingAchievement && existingAchievement.docId) {
+            // Update existing document to unlocked
+            const docRef = db.collection('userAchievements').doc(existingAchievement.docId);
+            batch.update(docRef, {
+              unlockedAt: this.admin.firestore.FieldValue.serverTimestamp(),
+              progress: 100
+            });
+          } else {
+            // Create new unlocked achievement
+            const newDocRef = db.collection('userAchievements').doc();
+            batch.set(newDocRef, {
+              userId: userId,
+              achievementId: achievement.achievementId,
+              unlockedAt: this.admin.firestore.FieldValue.serverTimestamp(),
+              progress: 100
+            });
           }
           
-          return {
-            success: true,
-            unlocked: true,
-            progress: progress
-          };
+          newlyUnlocked.push({
+            ...achievement,
+            unlockedAt: new Date()
+          });
+          
+          // Accumulate points
+          totalPointsEarned += achievement.points || 0;
+          
+          batchCount++;
+        } 
+        // Case 2: Achievement has progress but not yet unlocked
+        else if (!meetsCriteria.met && meetsCriteria.progress !== undefined && !unlockedIds.has(achievement.achievementId)) {
+          if (existingAchievement && existingAchievement.docId) {
+            // Update existing progress only if changed
+            if (existingAchievement.progress !== meetsCriteria.progress) {
+              const docRef = db.collection('userAchievements').doc(existingAchievement.docId);
+              batch.update(docRef, {
+                progress: meetsCriteria.progress
+              });
+              batchCount++;
+            }
+          } else {
+            // Create new progress entry
+            const newDocRef = db.collection('userAchievements').doc();
+            batch.set(newDocRef, {
+              userId: userId,
+              achievementId: achievement.achievementId,
+              unlockedAt: null,
+              progress: meetsCriteria.progress
+            });
+            batchCount++;
+          }
+        }
+        
+        // Commit batch if reaching limit
+        if (batchCount >= MAX_BATCH_SIZE) {
+          await batch.commit();
+          batchCount = 0;
         }
       }
       
-      // Invalidate cache
-      this.userAchievementsCache.delete(userId);
-      if (isRedisAvailable()) {
-        await redisClient.del(`${KEY_PREFIXES.USER_ACHIEVEMENTS}:${userId}`);
+      // Add XP updates to batch if there are newly unlocked achievements
+      if (totalPointsEarned > 0) {
+        // Update user XP
+        const userRef = db.collection('users').doc(userId);
+        batch.update(userRef, {
+          'stats.xp': this.admin.firestore.FieldValue.increment(totalPointsEarned)
+        });
+        batchCount++;
+        
+        const userLeaderboardRef = db.collection('leaderboard').doc(userId);
+        // Update existing leaderboard entry
+        batch.update(userLeaderboardRef.ref, {
+          totalScore: this.admin.firestore.FieldValue.increment(totalPointsEarned),
+          lastUpdated: this.admin.firestore.FieldValue.serverTimestamp()
+        });
+        batchCount++;
+      }
+      
+      // Commit remaining operations
+      if (batchCount > 0) {
+        await batch.commit();
+      }
+      
+      // Invalidate cache once after all updates
+      if (newlyUnlocked.length > 0 || batchCount > 0) {
+        this.userAchievementsCache.delete(userId);
+        if (isRedisAvailable()) {
+          await redisClient.del(`${KEY_PREFIXES.USER_ACHIEVEMENTS}:${userId}`);
+          // Also invalidate leaderboard cache if exists
+          await redisClient.del(`${KEY_PREFIXES.LEADERBOARD}:*`);
+        }
       }
       
       return {
         success: true,
-        unlocked: false,
-        progress: progress
+        newlyUnlocked: newlyUnlocked,
+        count: newlyUnlocked.length,
+        pointsEarned: totalPointsEarned
       };
-      
+
     } catch (error) {
-      console.error('Error updating achievement progress:', error);
-      return { 
-        success: false, 
-        message: 'Failed to update progress' 
+      console.error('Error checking achievements:', error);
+      return {
+        success: false,
+        newlyUnlocked: [],
+        count: 0,
+        pointsEarned: 0,
+        error: error.message
       };
     }
   }
@@ -362,7 +500,6 @@ class AchievementService {
       await db.collection('users').doc(userId).update({
         dailyLoginStreak: currentStreak,
         lastLoginDate: new Date().toISOString().split('T')[0], // YYYY-MM-DD
-        updatedAt: require('firebase-admin').firestore.FieldValue.serverTimestamp()
       });
       
       // Get all streak-based achievements
@@ -413,61 +550,6 @@ class AchievementService {
     }
   }
   
-  async updateWinStreak(userId, currentWinStreak) {
-    try {
-      const db = this.ensureDb();
-      
-      // Update user's win streak in leaderboard collection
-      await db.collection('leaderboard').doc(userId).update({
-        currentWinStreak: currentWinStreak,
-        updatedAt: require('firebase-admin').firestore.FieldValue.serverTimestamp()
-      });
-      
-      // Get all win streak achievements
-      const allAchievements = await this.getAllAchievements();
-      const streakAchievements = allAchievements.filter(a => 
-        a.criteria?.type === 'win_streak'
-      );
-      
-      const results = [];
-      
-      for (const achievement of streakAchievements) {
-        const target = achievement.criteria.target;
-        const progress = Math.min((currentWinStreak / target) * 100, 100);
-        
-        if (currentWinStreak >= target) {
-          const result = await this.unlockAchievement(userId, achievement.achievementId);
-          if (result.success) {
-            results.push({
-              achievementId: achievement.achievementId,
-              unlocked: true,
-              achievement: result.achievement
-            });
-          }
-        } else {
-          await this.updateAchievementProgress(userId, achievement.achievementId, progress);
-          results.push({
-            achievementId: achievement.achievementId,
-            unlocked: false,
-            progress: progress
-          });
-        }
-      }
-      
-      return {
-        success: true,
-        currentWinStreak: currentWinStreak,
-        achievements: results
-      };
-      
-    } catch (error) {
-      console.error('Error updating win streak:', error);
-      return {
-        success: false,
-        message: 'Failed to update win streak'
-      };
-    }
-  }
   
   async updateFriendCount(userId, friendCount) {
     console.log('userId, friendCount', userId, friendCount)
@@ -477,7 +559,7 @@ class AchievementService {
       // Update user's friend count
       await db.collection('users').doc(userId).update({
         friendCount: friendCount,
-        updatedAt: require('firebase-admin').firestore.FieldValue.serverTimestamp()
+        updatedAt: this.admin.firestore.FieldValue.serverTimestamp()
       });
       
       // Get all friend-based achievements
@@ -526,72 +608,19 @@ class AchievementService {
     }
   }
   
-  async incrementPerfectGames(userId) {
-    try {
-      const db = this.ensureDb();
-      const admin = require('firebase-admin');
-      
-      // Increment perfect games count
-      await db.collection('leaderboard').doc(userId).update({
-        perfectGames: admin.firestore.FieldValue.increment(1),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-      
-      // Get updated count
-      const leaderboardDoc = await db.collection('leaderboard').doc(userId).get();
-      const perfectGames = leaderboardDoc.data()?.perfectGames || 1;
-      
-      // Get all perfect score achievements
-      const allAchievements = await this.getAllAchievements();
-      const perfectAchievements = allAchievements.filter(a => 
-        a.criteria?.type === 'perfect_score'
-      );
-      
-      const results = [];
-      
-      for (const achievement of perfectAchievements) {
-        const target = achievement.criteria.target;
-        
-        if (perfectGames >= target) {
-          const result = await this.unlockAchievement(userId, achievement.achievementId);
-          if (result.success) {
-            results.push({
-              achievementId: achievement.achievementId,
-              unlocked: true,
-              achievement: result.achievement
-            });
-          }
-        }
-      }
-      
-      return {
-        success: true,
-        perfectGames: perfectGames,
-        achievements: results
-      };
-      
-    } catch (error) {
-      console.error('Error incrementing perfect games:', error);
-      return {
-        success: false,
-        message: 'Failed to increment perfect games'
-      };
-    }
-  }
-  
   // ============ ACHIEVEMENT CHECKING ============
   
   async checkAndUnlockAchievements(userId, userStats) {
     try {
       const allAchievements = await this.getAllAchievements();
       const userAchievements = await this.getUserAchievements(userId);
-      const unlockedIds = userAchievements.map(ua => ua.achievementId);
+      const unlockedIds = new Set(userAchievements.map(ua => ua.achievementId));
       
       const newlyUnlocked = [];
       
       for (const achievement of allAchievements) {
         // Skip if already unlocked
-        if (unlockedIds.includes(achievement.achievementId)) {
+        if (unlockedIds.has(achievement.achievementId)) {
           continue;
         }
         
@@ -671,6 +700,14 @@ class AchievementService {
         }
         return { met: false, progress: Math.min((wins / target) * 100, 99) };
         
+      case 'achievements_unlocked':
+        // Assumes userStats.unlockedAchievementCount is the number of achievements the user has
+        const unlockedCount = userStats.unlockedAchievementCount || 0;
+        return {
+          met: unlockedCount >= target,
+          progress: Math.floor(Math.min((unlockedCount / target) * 100, 100))
+        };
+      
       case 'perfect_score':
         const perfectGames = userStats.perfectGames || 0;
         if (perfectGames >= target) {
