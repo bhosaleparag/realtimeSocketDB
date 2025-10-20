@@ -242,6 +242,7 @@ class MatchmakingService {
           currentPlayers: 2,
           participants: [userId, matchResult.opponent.userId],
           perfectScore: userProfile.perfectScore,
+          gameSettings: userProfile.gameSettings,
           participantDetails: [
             {
               userId: userId,
@@ -272,6 +273,7 @@ class MatchmakingService {
           roomId: roomData.id,
           opponentId: matchResult.opponent.userId,
           participantDetails: roomData.participantDetails, 
+          gameSettings: roomData.gameSettings,
           message: 'Match found! Room created.',
         };
       }

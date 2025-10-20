@@ -104,7 +104,6 @@ module.exports = ({ socket, io, db }) => {
   socket.on('update-daily-streak', async (data) => {
     try {
       const { userId, currentStreak } = data;
-      console.log(userId, currentStreak)
       
       // Verify user
       if (socket.userId !== userId) {

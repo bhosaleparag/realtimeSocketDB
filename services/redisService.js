@@ -133,7 +133,7 @@ class RedisService {
     }
   }
   
-  async addPlayerToRoom(roomId, userId, username) {
+  async addPlayerToRoom(roomId, userId, username, skillLevel) {
     try {
       const roomKey = `${KEY_PREFIXES.ROOM}${roomId}`;
       const playersKey = `${KEY_PREFIXES.ROOM_PLAYERS}${roomId}`;
@@ -149,6 +149,7 @@ class RedisService {
       participantDetails.push({
         userId: userId,
         username: username,
+        skillLevel: skillLevel,
         joinedAt: Date.now(),
         isReady: false,
         score: 0,

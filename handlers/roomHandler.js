@@ -13,7 +13,7 @@ module.exports = ({ socket, io, db, activeUsers, activeRooms, roomUsers }) => {
   // Create new match room
   socket.on('create-room', async (data) => {
     try {
-      const { roomName, roomType = 'public', maxPlayers = 5, gameSettings = {} } = data;
+      const { roomName, roomType = 'public', maxPlayers = 5, gameSettings = {}, skillLevel } = data;
       const userId = socket.userId;
       const username = socket.username;
       
@@ -45,6 +45,7 @@ module.exports = ({ socket, io, db, activeUsers, activeRooms, roomUsers }) => {
           userId: userId,
           username: username,
           joinedAt: Date.now(),
+          skillLevel: skillLevel,
           isReady: false,
           score: 0
         }],
@@ -98,7 +99,7 @@ module.exports = ({ socket, io, db, activeUsers, activeRooms, roomUsers }) => {
   // Join existing room
   socket.on('join-room', async (data) => {
     try {
-      const { roomId } = data;
+      const { roomId, skillLevel } = data;
       const userId = socket.userId;
       const username = socket.username;
       
@@ -145,7 +146,7 @@ module.exports = ({ socket, io, db, activeUsers, activeRooms, roomUsers }) => {
       
       // Update room in Redis
       if (useRedis) {
-        await redisService.addPlayerToRoom(roomId, userId, username);
+        await redisService.addPlayerToRoom(roomId, userId, username, skillLevel);
         roomData = await redisService.getRoom(roomId);
       }
       
@@ -262,7 +263,7 @@ module.exports = ({ socket, io, db, activeUsers, activeRooms, roomUsers }) => {
 
       // CASE 1: Room was deleted (last player left) OR only 1 player remains
       // In multiplayer, if one player leaves, the other should win by forfeit
-      if (roomDeleted || remainingPlayers.length === 1) {
+      if (roomData.status === 'playing' && (roomDeleted || remainingPlayers.length === 1)) {
         console.log(`Player left room ${roomId} - ending game (${roomDeleted ? 'room empty' : 'only 1 player left'})`);
         
         // If there's still 1 player, they win by forfeit
@@ -367,7 +368,7 @@ module.exports = ({ socket, io, db, activeUsers, activeRooms, roomUsers }) => {
       const winners = finalScores.filter(p => p.score === highestScore);
 
       const gameType = roomData.gameSettings?.mode || 'quiz';
-
+      console.log(gameType)
       // Prepare all player results
       const playerResults = finalScores.map(participant => {
         let result = 'loss';
@@ -617,7 +618,7 @@ module.exports = ({ socket, io, db, activeUsers, activeRooms, roomUsers }) => {
   // Toggle player ready status
   socket.on('toggle-ready', async (data) => {
     try {
-      const { roomId } = data;
+      const { roomId, isReady } = data;
       const userId = socket.userId;
       
       if (!roomId) {
@@ -628,7 +629,7 @@ module.exports = ({ socket, io, db, activeUsers, activeRooms, roomUsers }) => {
       let roomData = null;
       
       if (useRedis) {
-        const result = await redisService.updatePlayerReady(roomId, userId, true);
+        const result = await redisService.updatePlayerReady(roomId, userId, isReady);
         roomData = await redisService.getRoom(roomId);
         
         const updatedParticipant = result.participantDetails.find(p => p.userId === userId);
@@ -892,20 +893,24 @@ module.exports = ({ socket, io, db, activeUsers, activeRooms, roomUsers }) => {
       const username = socket.username;
       const { skillLevel = 1000, gameSettings } = data;
 
-      const result = await matchmakingService.quickMatch(userId, {username, skillLevel, perfectScore: gameSettings?.xp || 50 });
+      let tempGameSettings = {
+        mode: 'quick',
+        timeLimit: 600, // 10 minutes
+        difficulty: 'medium',
+        ...gameSettings
+      }
+
+      const result = await matchmakingService.quickMatch(userId, {
+        username, skillLevel, 
+        perfectScore: gameSettings?.xp || 50,
+        gameSettings: tempGameSettings
+      });
       
       if (result.matched) {
         // Join both players to the created room
         socket.join(result.roomId);
-        
-        let tempGameSettings = {
-          mode: 'quick',
-          timeLimit: 600, // 10 minutes
-          difficulty: 'medium',
-          ...gameSettings
-        }
 
-        socket.emit('match-found', { ...result, gameSettings: tempGameSettings  });
+        socket.emit('match-found', result);
         
         // Notify opponent
         const opponentSockets = await io.in(`user_${result.opponentId}`).fetchSockets();

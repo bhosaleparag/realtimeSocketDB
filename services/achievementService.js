@@ -550,7 +550,6 @@ class AchievementService {
     }
   }
   
-  
   async updateFriendCount(userId, friendCount) {
     console.log('userId, friendCount', userId, friendCount)
     try {
