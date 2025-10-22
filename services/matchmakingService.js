@@ -289,6 +289,132 @@ class MatchmakingService {
     }
   }
   
+  // ============ Friend Match Invite ============
+
+  // Create friend invite
+  async createFriendInvite(inviteData) {
+    const { senderId, senderUsername, receiverId, receiverUsername, gameSettings } = inviteData;
+
+    const inviteId = `invite_${Date.now()}_${senderId}_${receiverId}`;
+    const expiresAt = Date.now() + (5 * 60 * 1000); // 5 minutes expiry
+
+    const invite = {
+      id: inviteId,
+      senderId,
+      senderUsername,
+      receiverId,
+      receiverUsername,
+      gameSettings,
+      status: 'pending',
+      createdAt: Date.now(),
+      expiresAt
+    };
+
+    // Store in Redis
+    await redisClient.setex(
+      `friend_invite:${inviteId}`,
+      300, // 5 minutes TTL
+      JSON.stringify(invite)
+    );
+
+    // Also store in user's invite lists for easy retrieval
+    await redisClient.sadd(`user_sent_invites:${senderId}`, inviteId);
+    await redisClient.sadd(`user_received_invites:${receiverId}`, inviteId);
+
+    // Set expiry for user lists
+    await redisClient.expire(`user_sent_invites:${senderId}`, 300);
+    await redisClient.expire(`user_received_invites:${receiverId}`, 300);
+
+    return invite;
+  }
+
+  // Get invite by ID
+  async getInvite(inviteId) {
+    const inviteData = await redisClient.get(`friend_invite:${inviteId}`);
+    
+    if (!inviteData) {
+      return null;
+    }
+
+    const invite = JSON.parse(inviteData);
+
+    // Check if expired
+    if (invite.expiresAt < Date.now()) {
+      await this.deleteInvite(inviteId);
+      return null;
+    }
+
+    return invite;
+  }
+
+  // Update invite status
+  async updateInviteStatus(inviteId, status) {
+    const invite = await this.getInvite(inviteId);
+    
+    if (!invite) {
+      throw new Error('Invite not found');
+    }
+
+    invite.status = status;
+    invite.updatedAt = Date.now();
+
+    const ttl = await redisClient.ttl(`friend_invite:${inviteId}`);
+    
+    await redisClient.setex(
+      `friend_invite:${inviteId}`,
+      Math.max(ttl, 60), // Keep for at least 1 minute
+      JSON.stringify(invite)
+    );
+
+    return invite;
+  }
+
+  // Delete invite
+  async deleteInvite(inviteId) {
+    const invite = await this.getInvite(inviteId);
+    
+    if (invite) {
+      // Remove from user lists
+      await redisClient.srem(`user_sent_invites:${invite.senderId}`, inviteId);
+      await redisClient.srem(`user_received_invites:${invite.receiverId}`, inviteId);
+    }
+
+    // Delete invite
+    await redisClient.del(`friend_invite:${inviteId}`);
+    
+    return true;
+  }
+
+  // Get all invites sent by user
+  async getUserSentInvites(userId) {
+    const inviteIds = await redisClient.smembers(`user_sent_invites:${userId}`);
+    const invites = await Promise.all(inviteIds.map(id => this.getInvite(id)));
+    return invites.filter(invite => invite !== null);
+  }
+
+  // Get all invites received by user
+  async getUserReceivedInvites(userId) {
+    const inviteIds = await redisClient.smembers(`user_received_invites:${userId}`);
+    const invites = await Promise.all(inviteIds.map(id => this.getInvite(id)));
+    return invites.filter(invite => invite !== null);
+  }
+
+  // Cancel all pending invites for a user
+  async cancelAllUserInvites(userId) {
+    const sentInvites = await this.getUserSentInvites(userId);
+    const receivedInvites = await this.getUserReceivedInvites(userId);
+
+    const allInvites = [...sentInvites, ...receivedInvites];
+
+    for (const invite of allInvites) {
+      if (invite.status === 'pending') {
+        await this.deleteInvite(invite.id);
+      }
+    }
+
+    return allInvites.length;
+  }
+
   // ============ RANKED MATCH ============
   
   async rankedMatch(userId, userProfile) {
@@ -472,6 +598,26 @@ class MatchmakingService {
         averageWaitTime: 0,
       };
     }
+  }
+
+  async cleanupExpiredInvites() {
+    const pattern = 'friend_invite:*';
+    const keys = await redisClient.keys(pattern);
+
+    let cleaned = 0;
+    for (const key of keys) {
+      const inviteData = await redisClient.get(key);
+      if (inviteData) {
+        const invite = JSON.parse(inviteData);
+        if (invite.expiresAt < Date.now()) {
+          const inviteId = key.replace('friend_invite:', '');
+          await this.deleteInvite(inviteId);
+          cleaned++;
+        }
+      }
+    }
+
+    return cleaned;
   }
   
   async cleanupQueue() {

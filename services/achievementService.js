@@ -492,24 +492,21 @@ class AchievementService {
   
   // ============ CRITERIA-SPECIFIC UPDATE FUNCTIONS ============
   
-  async updateDailyStreak(userId, currentStreak) {
+  async updateDailyStreak(userId, currentStreak, today) {
     try {
       const db = this.ensureDb();
       
       // Update user's daily streak in users collection
       await db.collection('users').doc(userId).update({
         dailyLoginStreak: currentStreak,
-        lastLoginDate: new Date().toISOString().split('T')[0], // YYYY-MM-DD
+        lastSeen: today, 
       });
       
       // Get all streak-based achievements
       const allAchievements = await this.getAllAchievements();
-      const streakAchievements = allAchievements.filter(a => 
-        a.criteria?.type === 'daily_streak'
-      );
+      const streakAchievements = allAchievements.filter(a => a.criteria?.type === 'daily_streak');
       
       const results = [];
-      
       for (const achievement of streakAchievements) {
         const target = achievement.criteria.target;
         const progress = Math.min((currentStreak / target) * 100, 100);
@@ -551,12 +548,13 @@ class AchievementService {
   }
   
   async updateFriendCount(userId, friendCount) {
-    console.log('userId, friendCount', userId, friendCount)
     try {
       const db = this.ensureDb();
+      const batch = db.batch();
       
       // Update user's friend count
-      await db.collection('users').doc(userId).update({
+      const userRef = db.collection('users').doc(userId);
+      batch.update(userRef, {
         friendCount: friendCount,
         updatedAt: this.admin.firestore.FieldValue.serverTimestamp()
       });
@@ -568,22 +566,40 @@ class AchievementService {
       );
       
       const results = [];
+      const userAchievementsRef = db.collection('userAchievements').doc(userId);
       
       for (const achievement of friendAchievements) {
         const target = achievement.criteria.target;
         const progress = Math.min((friendCount / target) * 100, 100);
         
         if (friendCount >= target) {
-          const result = await this.unlockAchievement(userId, achievement.achievementId);
-          if (result.success) {
+          // Check if already unlocked to avoid duplicate writes
+          const userAchievement = await userAchievementsRef.get();
+          const existingData = userAchievement.data()?.[achievement.achievementId];
+          
+          if (!existingData?.unlocked) {
+            batch.set(userAchievementsRef, {
+              [achievement.achievementId]: {
+                unlocked: true,
+                unlockedAt: this.admin.firestore.FieldValue.serverTimestamp(),
+                progress: 100
+              }
+            }, { merge: true });
+            
             results.push({
               achievementId: achievement.achievementId,
               unlocked: true,
-              achievement: result.achievement
+              achievement: achievement
             });
           }
         } else {
-          await this.updateAchievementProgress(userId, achievement.achievementId, progress);
+          batch.set(userAchievementsRef, {
+            [achievement.achievementId]: {
+              progress: progress,
+              unlocked: false
+            }
+          }, { merge: true });
+          
           results.push({
             achievementId: achievement.achievementId,
             unlocked: false,
@@ -591,6 +607,9 @@ class AchievementService {
           });
         }
       }
+      
+      // Commit all updates at once
+      await batch.commit();
       
       return {
         success: true,

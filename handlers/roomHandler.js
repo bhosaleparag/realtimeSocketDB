@@ -954,6 +954,256 @@ module.exports = ({ socket, io, db, activeUsers, activeRooms, roomUsers }) => {
       });
     }
   });
+
+  // Friend Match Invite
+  socket.on('friend-match-invite', async (data) => {
+    try {
+      const senderId = socket.userId;
+      const senderUsername = socket.username;
+      const { friendId, friendUsername, gameSettings } = data;
+
+      // Create invite
+      const invite = await matchmakingService.createFriendInvite({
+        senderId,
+        senderUsername,
+        receiverId: friendId,
+        receiverUsername: friendUsername,
+        gameSettings
+      });
+
+      // Notify sender
+      socket.emit('friend-invite-sent', {
+        invite,
+        message: `Invite sent to ${friendUsername}`
+      });
+
+      // Notify receiver if online
+      const receiverSockets = await io.in(`user_${friendId}`).fetchSockets();
+      if (receiverSockets.length > 0) {
+        receiverSockets[0].emit('friend-invite-received', {
+          invite,
+          message: `${senderUsername} invited you to play`
+        });
+      }
+
+    } catch (error) {
+      console.error('Error sending friend invite:', error);
+      socket.emit('friend-invite-error', {
+        message: error.message || 'Failed to send invite'
+      });
+    }
+  });
+
+  // Accept Friend Invite
+  socket.on('friend-match-accept', async (data) => {
+    try {
+      const userId = socket.userId;
+      const username = socket.username;
+      const { inviteId } = data;
+
+      // Get and validate invite
+      const invite = await matchmakingService.getInvite(inviteId);
+      
+      if (!invite) {
+        socket.emit('friend-invite-error', { message: 'Invite not found or expired' });
+        return;
+      }
+
+      if (invite.receiverId !== userId) {
+        socket.emit('friend-invite-error', { message: 'Invalid invite' });
+        return;
+      }
+
+      if (invite.status !== 'pending') {
+        socket.emit('friend-invite-error', { message: 'Invite already processed' });
+        return;
+      }
+
+      // Update invite status
+      await matchmakingService.updateInviteStatus(inviteId, 'accepted');
+
+      // Create room
+      const roomData = {
+        id: `friend_${Date.now()}_${invite.senderId}`,
+        name: `${invite.senderUsername} vs ${username}`,
+        type: 'friend',
+        createdBy: invite.senderId,
+        creatorUsername: invite.senderUsername,
+        maxPlayers: 2,
+        currentPlayers: 2,
+        participants: [invite.senderId, userId],
+        perfectScore: invite.gameSettings?.xp || 50,
+        gameSettings: invite.gameSettings,
+        participantDetails: [
+          {
+            userId: invite.senderId,
+            username: invite.senderUsername,
+            joinedAt: Date.now(),
+            isReady: true,
+            score: 0,
+            skillLevel: 0,
+          },
+          {
+            userId: userId,
+            username: username,
+            joinedAt: Date.now(),
+            isReady: true,
+            score: 0,
+            skillLevel: 0,
+          }
+        ],
+        status: 'waiting',
+        createdAt: Date.now(),
+        lastActivity: Date.now(),
+      };
+
+      await redisService.createRoom(roomData);
+
+      // Join both players to room
+      socket.join(roomData.id);
+
+      // Notify receiver (current socket)
+      socket.emit('friend-match-found', {
+        roomId: roomData.id,
+        participants: roomData.participants,
+        participantDetails: roomData.participantDetails,
+        gameSettings: roomData.gameSettings,
+        message: 'Match created!'
+      });
+
+      // Notify sender
+      const senderSockets = await io.in(`user_${invite.senderId}`).fetchSockets();
+      if (senderSockets.length > 0) {
+        senderSockets[0].join(roomData.id);
+        senderSockets[0].emit('friend-match-found', {
+          roomId: roomData.id,
+          participantDetails: roomData.participantDetails,
+          gameSettings: roomData.gameSettings,
+          message: 'Your friend accepted!'
+        });
+        
+        senderSockets[0].emit('friend-invite-accepted', {
+          inviteId,
+          receiverUsername: username
+        });
+      }
+
+      // Start countdown
+      io.to(roomData.id).emit('game-starting-countdown', {
+        roomId: roomData.id,
+        countdown: 5
+      });
+
+      // Start game after countdown
+      setTimeout(async () => {
+        try {
+          await redisService.updateRoom(roomData.id, {
+            status: 'playing',
+            gameStartedAt: Date.now()
+          });
+
+          io.to(roomData.id).emit('game-started', {
+            roomId: roomData.id,
+            participants: roomData.participantDetails
+          });
+        } catch (error) {
+          console.error('Error starting friend match game:', error);
+        }
+      }, 5000);
+
+      // Delete invite
+      await matchmakingService.deleteInvite(inviteId);
+
+    } catch (error) {
+      console.error('Error accepting friend invite:', error);
+      socket.emit('friend-invite-error', {
+        message: 'Failed to accept invite'
+      });
+    }
+  });
+
+  // Decline Friend Invite
+  socket.on('friend-match-decline', async (data) => {
+    try {
+      const userId = socket.userId;
+      const username = socket.username;
+      const { inviteId } = data;
+
+      const invite = await matchmakingService.getInvite(inviteId);
+      
+      if (!invite || invite.receiverId !== userId) {
+        socket.emit('friend-invite-error', { message: 'Invalid invite' });
+        return;
+      }
+
+      // Update status
+      await matchmakingService.updateInviteStatus(inviteId, 'declined');
+
+      // Notify sender
+      const senderSockets = await io.in(`user_${invite.senderId}`).fetchSockets();
+      if (senderSockets.length > 0) {
+        senderSockets[0].emit('friend-invite-declined', {
+          inviteId,
+          receiverUsername: username,
+          message: `${username} declined your invite`
+        });
+      }
+      
+      // Confirm to receiver
+      socket.emit('friend-invite-declined', {
+        inviteId,
+        message: 'Invite declined'
+      });
+
+      // Delete invite
+      await matchmakingService.deleteInvite(inviteId);
+
+    } catch (error) {
+      console.error('Error declining friend invite:', error);
+      socket.emit('friend-invite-error', {
+        message: 'Failed to decline invite'
+      });
+    }
+  });
+
+  // Cancel Friend Invite (sender cancels)
+  socket.on('friend-match-cancel', async (data) => {
+    try {
+      const userId = socket.userId;
+      const { inviteId } = data;
+
+      const invite = await matchmakingService.getInvite(inviteId);
+      
+      if (!invite || invite.senderId !== userId) {
+        socket.emit('friend-invite-error', { message: 'Invalid invite' });
+        return;
+      }
+
+      // Notify receiver
+      const receiverSockets = await io.in(`user_${invite.receiverId}`).fetchSockets();
+      if (receiverSockets.length > 0) {
+        receiverSockets[0].emit('friend-invite-cancelled', {
+          inviteId,
+          message: 'Invite was cancelled'
+        });
+      }
+
+      // Confirm to sender
+      socket.emit('friend-invite-cancelled', {
+        inviteId,
+        message: 'Invite cancelled'
+      });
+
+      // Delete invite
+      await matchmakingService.deleteInvite(inviteId);
+
+    } catch (error) {
+      console.error('Error cancelling friend invite:', error);
+      socket.emit('friend-invite-error', {
+        message: 'Failed to cancel invite'
+      });
+    }
+  });
   
   // Cancel matchmaking
   socket.on('cancel-matchmaking', async (data) => {

@@ -157,33 +157,71 @@ io.on('connection', async (socket) => {
 
   // Handle disconnection
   socket.on('disconnect', async () => {
-    console.log(`User disconnected: ${socket.username} (${socket.userId})`);
+    const userId = socket.userId;
+    const username = socket.username;
+    console.log(`User disconnected: ${username} (${userId})`);
     
     // Leave user's personal room
-    socket.leave(`user_${socket.userId}`);
+    socket.leave(`user_${userId}`);
     
     // Remove from active rooms
     if (userData.currentRoom) {
       const roomUserSet = roomUsers.get(userData.currentRoom);
       if (roomUserSet) {
-        roomUserSet.delete(socket.userId);
+        roomUserSet.delete(userId);
         socket.to(userData.currentRoom).emit('user-left-room', {
-          userId: socket.userId,
-          username: socket.username,
+          userId: userId,
+          username: username,
           roomId: userData.currentRoom
         });
       }
     }
     
     // Remove from active users
-    activeUsers.delete(socket.userId);
+    activeUsers.delete(userId);
     // Remove from matchmaking queue if present
-    await matchmakingService.removeFromQueue(socket.userId);
+    await matchmakingService.removeFromQueue(userId);
+
+    // ========= Cancel all pending friend match invites ==========
+    if (userId) {
+      const cancelledCount = await matchmakingService.cancelAllUserInvites(userId);
+      
+      if (cancelledCount > 0) {
+        console.log(`Cancelled ${cancelledCount} pending invites for user ${userId}`);
+        
+        // Notify affected users
+        const sentInvites = await matchmakingService.getUserSentInvites(userId);
+        const receivedInvites = await matchmakingService.getUserReceivedInvites(userId);
+        
+        // Notify receivers of cancelled sent invites
+        for (const invite of sentInvites) {
+          const receiverSockets = await io.in(`user_${invite.receiverId}`).fetchSockets();
+          if (receiverSockets.length > 0) {
+            receiverSockets[0].emit('friend-invite-cancelled', {
+              inviteId: invite.id,
+              message: `${username} went offline`
+            });
+          }
+        }
+        
+        // Notify senders of declined received invites
+        for (const invite of receivedInvites) {
+          const senderSockets = await io.in(`user_${invite.senderId}`).fetchSockets();
+          if (senderSockets.length > 0) {
+            senderSockets[0].emit('friend-invite-declined', {
+              inviteId: invite.id,
+              receiverUsername: username,
+              message: `${username} went offline`
+            });
+          }
+        }
+      }
+    }
     
     // Broadcast updated user list
     io.emit('user-disconnected', {
-      userId: socket.userId,
-      username: socket.username,
+      userId: userId,
+      username: username,
       activeUsersCount: activeUsers.size
     });
   });
@@ -240,6 +278,7 @@ setInterval(async () => {
       
       // Cleanup matchmaking queue
       await matchmakingService.cleanupQueue();
+      await matchmakingService.cleanupExpiredInvites();
     }
     
     console.log('✅ Cleanup job completed');

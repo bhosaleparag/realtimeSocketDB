@@ -46,70 +46,17 @@ module.exports = ({ socket, io, db }) => {
       });
     }
   });
-  
-  // Manually unlock achievement (for testing or admin)
-  socket.on('unlock-achievement', async (data) => {
-    try {
-      const { achievementId } = data;
-      const userId = socket.userId;
-      const username = socket.username;
-      
-      if (!achievementId) {
-        socket.emit('achievement-error', { message: 'Achievement ID is required' });
-        return;
-      }
-      
-      const result = await achievementService.unlockAchievement(userId, achievementId);
-      
-      if (result.success) {
-        // Notify user
-        socket.emit('achievement-unlocked', {
-          achievement: result.achievement,
-          points: result.points,
-          timestamp: new Date()
-        });
-        
-        // Broadcast to all users (for social features)
-        io.emit('user-achievement-unlocked', {
-          userId: userId,
-          username: username,
-          achievement: result.achievement,
-          timestamp: new Date()
-        });
-        
-        // Update user's total achievement points in Firebase
-        const userRef = db.collection('users').doc(userId);
-        await userRef.update({
-          achievementPoints: admin.firestore.FieldValue.increment(result.points),
-          totalAchievements: admin.firestore.FieldValue.increment(1),
-          lastAchievementUnlockedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-        
-      } else {
-        socket.emit('achievement-error', {
-          message: result.message,
-          alreadyUnlocked: result.alreadyUnlocked
-        });
-      }
-      
-    } catch (error) {
-      console.error('Error unlocking achievement:', error);
-      socket.emit('achievement-error', {
-        message: 'Failed to unlock achievement'
-      });
-    }
-  });
 
   // Update daily streak
   socket.on('update-daily-streak', async (data) => {
     try {
-      const { userId, currentStreak } = data;
+      const { userId, currentStreak, today } = data;
       
       // Verify user
       if (socket.userId !== userId) {
         return socket.emit('achievement-error', { message: 'Unauthorized' });
       }
-      const result = await achievementService.updateDailyStreak(userId, currentStreak);
+      const result = await achievementService.updateDailyStreak(userId, currentStreak, admin.firestore.FieldValue.serverTimestamp());
       
       if (result.success && result.achievements.length > 0) {
         const unlocked = result.achievements.filter(a => a.unlocked);
